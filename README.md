@@ -2,7 +2,7 @@
 
 Evidence-driven frontend QA built on [Jev Ultrafast](https://github.com/browser-use/jev-ultrafast) and [Browser Harness](https://github.com/browser-use/browser-harness).
 
-**Status:** design approved; implementation tracked in [GitHub Issues](https://github.com/Nainish-Rai/jev-frontend-qa/issues). The runnable CLI and demo are not implemented yet.
+**Status:** the standalone todo demo is implemented and browser-verified. The QA runner is under active implementation; acceptance is tracked in [GitHub Issues](https://github.com/Nainish-Rai/jev-frontend-qa/issues).
 
 ## Intended workflow
 
@@ -16,7 +16,14 @@ A coding agent supplies a scenario, exact fixture values, and assertions. Jev se
 
 ## Synthetic demo
 
-The separate todo demo will exercise create, edit, complete/uncomplete, delete, validation, and persistence through a real API and SQLite. Deliberately broken variants will prove that the tester detects false success, incorrect payloads, and lost saves. All demo data is synthetic; proprietary applications are out of scope.
+The [standalone todo demo](demo/README.md) supports create, edit, complete/uncomplete, delete, validation, and persistence through a real API and SQLite. All demo data is synthetic; proprietary applications are out of scope.
+
+```bash
+uv sync
+uv run jev-todo --port 8767 --database artifacts/todo.sqlite3
+```
+
+Open `http://127.0.0.1:8767/`. Deliberately broken variants are tracked separately to prove that the tester detects false success, incorrect payloads, and lost saves.
 
 ## Development
 

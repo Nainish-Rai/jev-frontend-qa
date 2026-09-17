@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Synthetic Todo — Jev Frontend QA Reference</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to main content</a>
+
+    <header class="masthead" role="banner">
+      <div class="masthead__inner">
+        <p class="masthead__eyebrow">Jev Frontend QA · Reference Application</p>
+        <h1 class="masthead__title">Synthetic Todo</h1>
+        <p class="masthead__lede">
+          A deliberately small reference app. Every change goes through the
+          <span class="inline-mono">/api/todos</span> endpoint and lands in a
+          local SQLite file. No logins, no third-party calls, no analytics.
+        </p>
+      </div>
+    </header>
+
+    <main id="main" class="layout" tabindex="-1">
+      <section class="panel panel--create" aria-labelledby="create-title">
+        <header class="panel__head">
+          <h2 id="create-title" class="panel__title">New todo</h2>
+        </header>
+        <form id="create-form" class="create-form" novalidate>
+          <label class="field">
+            <span class="field__label">Todo title</span>
+            <input
+              id="create-input"
+              class="field__input"
+              type="text"
+              name="title"
+              autocomplete="off"
+              maxlength="500"
+              required
+              aria-describedby="create-status"
+            />
+          </label>
+          <div class="create-form__actions">
+            <button id="create-submit" class="button button--primary" type="submit">
+              Create todo
+            </button>
+          </div>
+        </form>
+        <p id="create-status" class="status" role="status" aria-live="polite"></p>
+      </section>
+
+      <section class="panel panel--list" aria-labelledby="list-title">
+        <header class="panel__head panel__head--row">
+          <h2 id="list-title" class="panel__title">All todos</h2>
+          <p class="panel__count" data-testid="todo-count">
+            <span id="todo-count-value">0</span>
+            <span class="panel__count-suffix">stored</span>
+          </p>
+        </header>
+        <ol
+          id="todo-list"
+          class="todo-list"
+          aria-live="polite"
+          aria-relevant="additions removals text"
+        ></ol>
+        <p id="list-empty" class="empty-state" hidden>
+          Nothing yet. Create your first todo above.
+        </p>
+      </section>
+    </main>
+
+    <footer class="colophon" role="contentinfo">
+      <p class="colophon__line">
+        Built for the Jev Frontend QA runner. Synthetic data only.
+      </p>
+      <p class="colophon__line colophon__line--mono">
+        <span id="db-indicator" data-state="unknown">Database status: unknown</span>
+      </p>
+    </footer>
+
+    <template id="todo-row-template">
+      <li class="todo-row" data-testid="todo-row">
+        <div class="todo-row__main">
+          <span class="todo-row__title" data-testid="todo-title"></span>
+          <span class="todo-row__id" data-testid="todo-id"></span>
+        </div>
+        <div class="todo-row__controls">
+          <button
+            type="button"
+            class="button button--ghost"
+            data-action="toggle"
+            data-testid="todo-toggle"
+          ></button>
+          <button
+            type="button"
+            class="button button--ghost"
+            data-action="edit"
+            data-testid="todo-edit"
+          ></button>
+          <button
+            type="button"
+            class="button button--danger"
+            data-action="delete"
+            data-testid="todo-delete"
+          ></button>
+        </div>
+      </li>
+    </template>
+
+    <template id="todo-edit-template">
+      <form class="todo-edit todo-edit-form" data-testid="todo-edit-form" novalidate>
+        <label class="field">
+          <span class="field__label">Edit title</span>
+          <input
+            class="field__input todo-edit__input"
+            type="text"
+            name="title"
+            autocomplete="off"
+            maxlength="500"
+            required
+          />
+        </label>
+        <div class="todo-edit__actions">
+          <button type="submit" class="button button--primary">Save changes</button>
+          <button type="button" class="button button--ghost" data-action="cancel-edit">
+            Cancel
+          </button>
+        </div>
+        <p class="status" role="status" aria-live="polite"></p>
+      </form>
+    </template>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>
