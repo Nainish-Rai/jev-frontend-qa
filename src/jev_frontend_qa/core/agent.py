@@ -278,7 +278,7 @@ class Runner:
                 observation["reading"] = reading
             decision = self.planner.choose(
                 goal=self._redact(base.goal),
-                observation=self._redact(observation),
+                observation=self._redact(_compact_planner_observation(observation)),
                 history=self._redact(history[-8:]) if self.policy.model_disclosure.allow_action_history else [],
                 fixtures=self._redact(base.fixtures),
                 deadline=self._scenario_deadline,
@@ -386,7 +386,18 @@ class Runner:
                 observation=result_observation,
             )
             self._exploration_events.append(event)
-            history.append(event.model_dump())
+            history.append(
+                {
+                    "turn": turn,
+                    "operation": operation,
+                    "goal": event.goal,
+                    "status": status,
+                    "reason": event.reason,
+                    "url": result_observation.get("page", result_observation).get("url", page.url),
+                    "note": result_observation.get("note"),
+                    "actions": result_observation.get("actions", []),
+                }
+            )
             self._findings["model_judgments"].append(
                 f"Planner turn {turn}: {operation}: {decision.reason}; not a correctness verdict"
             )
@@ -1095,6 +1106,51 @@ class Runner:
 
     def _redact(self, value: Any) -> Any:
         return redact_report(value, self.policy.redaction, secrets=self._secrets)
+
+
+def _compact_planner_observation(observation: dict) -> dict:
+    """Project planner context without discarding the report's full observations."""
+    controls = []
+    offscreen: dict[str, int] = {}
+    for control in observation["controls"]:
+        validation = control.get("validation") or {}
+        invalid = validation.get("valid") is False or control.get("aria_invalid") not in (None, False, "false")
+        if control.get("availability") == "offscreen" and not invalid:
+            role = control.get("role") or control.get("kind") or "unknown"
+            offscreen[role] = offscreen.get(role, 0) + 1
+            continue
+        compact = {
+            key: value
+            for key, value in control.items()
+            if key not in {"id", "rect", "node", "accessibility", "validation"}
+            and value is not None
+            and not (key in {"unsupported", "focused"} and value is False)
+            and not (key in {"context", "option_labels"} and not value)
+            and not (key == "control_label" and value == control.get("label"))
+        }
+        if validation.get("valid") is False:
+            compact["validation"] = {key: value for key, value in validation.items() if key == "valid" or value}
+        controls.append(compact)
+    text = observation["text"]
+    return {
+        **observation,
+        "text": text[:3000],
+        "controls": controls,
+        "offscreen_controls": offscreen,
+        "milestones": [
+            {"goal": milestone["goal"], "status": "complete", "url": milestone["url"]}
+            for milestone in observation["milestones"]
+        ],
+        "limits": {
+            **observation["limits"],
+            "text_truncated": observation["limits"]["text_truncated"] or len(text) > 3000,
+            "snapshot_text_truncated": observation["limits"]["text_truncated"],
+            "text_characters": len(text),
+            "text_characters_shown": min(len(text), 3000),
+            "offscreen_controls_summarized": sum(offscreen.values()),
+            "discovery": "Use read to search/page loaded text and links; scroll to reveal offscreen controls.",
+        },
+    }
 
 
 def _scope_query(step: Step) -> str:

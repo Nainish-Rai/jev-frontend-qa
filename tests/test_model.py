@@ -20,6 +20,14 @@ PAGE = {
         {"id": "wait", "kind": "wait", "label": "Wait"},
     ],
 }
+MULTI_TARGET_PAGE = {
+    **PAGE,
+    "actions": [
+        *PAGE["actions"],
+        {"id": "e3", "kind": "fill", "label": "Description", "node": 30, "value": ""},
+        {"id": "e4", "kind": "click", "label": "Cancel", "node": 40},
+    ],
+}
 
 
 def answer(choice, options, confidence=0.95):
@@ -38,12 +46,50 @@ def provider(callback):
     return TypeSafeDecisionProvider(name="typesafe", client=client)
 
 
-def choose_with(callback):
+def choose_with(callback, *, page=PAGE):
     selected = provider(callback)
     try:
-        return selected.choose(goal="Create a todo", page=PAGE, history=[])
+        return selected.choose(goal="Create a todo", page=page, history=[])
     finally:
         selected.client.close()
+
+
+def test_single_targets_only_judge_operation_without_inventing_target_confidence_or_usage():
+    requests = []
+
+    def respond(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        assert set(body["questions"]) == {"operation"}
+        options = body["questions"]["operation"]["criteria"]
+        operation = answer("TYPE_TEXT", options, 0.7)
+        operation["probabilities"] = {option: 0.0 for option in options}
+        operation["probabilities"].update(TYPE_TEXT=0.8, DONE=0.2)
+        return httpx.Response(200, json={"answers": {"operation": operation}})
+
+    selected = provider(respond)
+    try:
+        decision = selected.choose(goal="Create a todo", page=PAGE, history=[])
+    finally:
+        selected.client.close()
+    assert decision.choice == "e1"
+    assert decision.operation == "TYPE_TEXT"
+    assert decision.target == "1"
+    assert decision.confidence == 0.7
+    assert decision.probabilities == {"e1": 0.8}
+    assert decision.target_confidence is None
+    assert decision.target_probabilities is None
+    assert len(requests) == 1
+    usage = selected.client.usage_summary()
+    assert (usage.requests, usage.failed_requests) == (1, 0)
+    assert usage.total_tokens is None
+    assert usage.cost_usd is None
+
+
+def test_single_target_still_requires_a_valid_operation_answer():
+    with pytest.raises(ModelError) as failure:
+        choose_with(lambda _: httpx.Response(200, json={"answers": {"type_text_target": answer("1", ["1", "NONE"])}}))
+    assert failure.value.code == "invalid_choice"
 
 
 def test_batched_targets_obey_api_and_only_selected_branch_is_consumed():
@@ -66,12 +112,12 @@ def test_batched_targets_obey_api_and_only_selected_branch_is_consumed():
             },
         )
 
-    decision = choose_with(respond)
+    decision = choose_with(respond, page=MULTI_TARGET_PAGE)
     assert decision.choice == "e1"
     assert decision.confidence == 0.3  # A confident operation cannot hide an uncertain target.
 
 
-def test_target_no_match_blocks_instead_of_forcing_the_only_input():
+def test_multiple_target_no_match_blocks_instead_of_forcing_an_input():
     def respond(request):
         questions = json.loads(request.content)["questions"]
         return httpx.Response(
@@ -84,7 +130,7 @@ def test_target_no_match_blocks_instead_of_forcing_the_only_input():
             },
         )
 
-    decision = choose_with(respond)
+    decision = choose_with(respond, page=MULTI_TARGET_PAGE)
     assert decision.operation == "BLOCKED"
     assert decision.choice == "BLOCKED"
 
@@ -97,15 +143,23 @@ def test_wait_maps_to_observed_control_without_target_branch():
     assert choose_with(respond).choice == "wait"
 
 
-def test_unknown_operation_never_becomes_an_action():
+@pytest.mark.parametrize(
+    ("operation", "page"),
+    [
+        ("execute-arbitrary-javascript", PAGE),
+        ("SELECT", PAGE),
+        ("TYPE_TEXT", {"actions": []}),
+    ],
+)
+def test_unknown_or_unoffered_operation_never_becomes_an_action(operation, page):
     def respond(request):
         options = json.loads(request.content)["questions"]["operation"]["criteria"]
-        invalid = answer("CLICK", options)
-        invalid["choice"] = "execute-arbitrary-javascript"
+        invalid = answer("DONE", options)
+        invalid["choice"] = operation
         return httpx.Response(200, json={"answers": {"operation": invalid}})
 
     with pytest.raises(ModelError) as failure:
-        choose_with(respond)
+        choose_with(respond, page=page)
     assert failure.value.code == "invalid_choice"
 
 

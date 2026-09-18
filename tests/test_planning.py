@@ -75,7 +75,13 @@ def test_wait_checkpoint_returns_control_to_planner_without_resetting_progress(m
     )
     assert report.verdict == "complete" and browser.clicks == 0
     assert report.exploration[0].status == "checkpoint"
-    assert planner.calls[1]["history"][0]["observation"]["page"]["text"] == state.text
+    previous = planner.calls[1]["history"][0]
+    assert previous["goal"] == "Wait for result"
+    assert previous["status"] == "checkpoint"
+    assert previous["note"].startswith("Checkpoint:")
+    assert previous["actions"] == [{"operation": "WAIT", "label": "Wait"}] * 2
+    assert "observation" not in previous
+    assert report.exploration[0].observation["page"]["text"] == state.text
 
 
 def test_stale_observation_refreshes_before_input_but_ambiguous_input_never_retries(monkeypatch):
@@ -186,3 +192,151 @@ def test_observation_only_planner_saves_one_step_screenshot(tmp_path, monkeypatc
     ).run()
     assert outcome.report.verdict == "complete"
     assert len(outcome.report.screenshots) == 1
+
+
+def test_completed_progress_survives_recent_history_without_replaying_page_snapshots(monkeypatch):
+    state = page(text="A large observed page " * 200, links=({"url": ORIGIN + "/details", "label": "Details"},))
+    report, browser, planner, _ = planned(
+        monkeypatch,
+        [
+            {"operation": "act", "goal": "Create the item", "reason": "Exercise creation"},
+            *[{"operation": "observe", "reason": "Inspect result"} for _ in range(8)],
+            {"operation": "complete", "reason": "Exploration finished"},
+        ],
+        [choice("CLICK", "e1"), choice()],
+        state=state,
+        permissions=policy(allow_planner=True, allow_action_history=True),
+    )
+    assert report.verdict == "complete" and browser.clicks == 1
+    progress = planner.calls[1]["history"][0]
+    assert progress["goal"] == "Create the item"
+    assert progress["status"] == "complete"
+    assert progress["reason"] == "Exercise creation"
+    assert progress["url"] == state.url
+    assert progress["actions"] == [{"operation": "CLICK", "label": "Create"}]
+    assert planner.calls[-1]["observation"]["milestones"] == [
+        {"goal": "Create the item", "status": "complete", "url": state.url}
+    ]
+    for call in planner.calls:
+        for previous in call["history"]:
+            assert not {"observation", "page", "controls", "links", "text", "milestones"} & previous.keys()
+    assert all(previous["operation"] == "observe" for previous in planner.calls[-1]["history"])
+    assert report.exploration[0].observation["page"]["text"] == state.text
+    assert report.exploration[1].observation["links"] == list(state.links)
+    assert report.exploration[1].observation["text"] == state.text
+
+
+def test_planner_retains_field_state_and_blockers_while_summarizing_offscreen_controls(monkeypatch):
+    invalid = {
+        "valid": False,
+        "message": "Enter a title",
+        "value_missing": True,
+        "too_long": False,
+        "pattern_mismatch": False,
+    }
+    field = {
+        "node": 10,
+        "id": "e10",
+        "role": "textbox",
+        "label": "Title",
+        "control_label": "Title",
+        "fixture_key": "title",
+        "value": "",
+        "context": ["Create item"],
+        "availability": "available",
+        "focused": False,
+        "unsupported": False,
+        "validation": invalid,
+        "rect": {"x": 20},
+        "accessibility": {"backend_node_id": 10},
+    }
+    controls = (
+        field,
+        {"role": "button", "label": "Submit", "availability": "disabled", "fixture_key": None},
+        {"role": "button", "label": "Delete", "availability": "occluded"},
+        {"role": "tab", "label": "Details", "availability": "available", "selected": False, "expanded": "false"},
+        {
+            "role": "textbox",
+            "label": "Search",
+            "availability": "available",
+            "value": "query",
+            "validation": {"valid": True, "message": "", "value_missing": False},
+        },
+        {"role": "link", "label": "Below the fold", "availability": "offscreen"},
+        {"role": "link", "label": "More below", "availability": "offscreen"},
+        {**field, "label": "Hidden required title", "availability": "offscreen"},
+    )
+    diagnostics = {"backend": "accessibility", "unsupported_widgets": ["canvas"]}
+    report, _, planner, _ = planned(
+        monkeypatch,
+        [{"operation": "observe"}, {"operation": "complete"}],
+        state=page(controls=controls, diagnostics=diagnostics),
+    )
+    observed = planner.calls[0]["observation"]
+    projected = {control["label"]: control for control in observed["controls"]}
+    assert projected["Title"] == {
+        "role": "textbox",
+        "label": "Title",
+        "fixture_key": "title",
+        "value": "",
+        "context": ["Create item"],
+        "availability": "available",
+        "validation": {"valid": False, "message": "Enter a title", "value_missing": True},
+    }
+    assert projected["Submit"]["availability"] == "disabled"
+    assert projected["Delete"]["availability"] == "occluded"
+    assert projected["Details"]["selected"] is False
+    assert projected["Details"]["expanded"] == "false"
+    assert projected["Search"]["value"] == "query"
+    assert "validation" not in projected["Search"]
+    assert projected["Hidden required title"]["validation"]["valid"] is False
+    assert "Below the fold" not in projected and "More below" not in projected
+    assert observed["offscreen_controls"] == {"link": 2}
+    assert observed["limits"]["offscreen_controls_summarized"] == 2
+    assert observed["diagnostics"]["unsupported_widgets"] == ["canvas"]
+    assert report.exploration[0].observation["controls"][0]["validation"] == invalid
+    assert report.exploration[0].observation["controls"][-2]["label"] == "More below"
+
+
+def test_truncated_planner_text_can_be_discovered_by_read_without_losing_report_evidence(monkeypatch):
+    from jev_frontend_qa.core import page_reader
+
+    text = "Visible content " * 250 + "Details beyond the planner preview"
+    destination = ORIGIN + "/discovered-by-reading"
+    reading = {
+        "url": ORIGIN + "/",
+        "text": "Details beyond the planner preview",
+        "links": [{"url": destination, "label": "Read details"}],
+        "scan_limited": False,
+    }
+    reads = []
+
+    def read_page(transport, *, query, offset):
+        reads.append((query, offset))
+        return reading
+
+    monkeypatch.setattr(page_reader, "read_page", read_page)
+    report, browser, planner, _ = planned(
+        monkeypatch,
+        [
+            {"operation": "observe"},
+            {"operation": "read", "query": "Details"},
+            {"operation": "navigate", "url": destination},
+            {"operation": "complete"},
+        ],
+        state=page(text=text),
+        permissions=policy(allow_planner=True, allow_action_history=True),
+    )
+    observed = planner.calls[0]["observation"]
+    assert observed["text"] == text[:3000]
+    assert observed["limits"]["text_truncated"] is True
+    assert observed["limits"]["snapshot_text_truncated"] is False
+    assert observed["limits"]["text_characters"] == len(text)
+    assert observed["limits"]["text_characters_shown"] == 3000
+    assert reads == [("Details", 0)]
+    assert planner.calls[2]["observation"]["reading"] == reading
+    assert all("observation" not in previous for previous in planner.calls[2]["history"])
+    assert destination in browser.navigations
+    assert report.verdict == "complete"
+    assert report.exploration[0].observation["text"] == text
+    assert report.exploration[1].observation == reading

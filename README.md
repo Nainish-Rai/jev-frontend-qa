@@ -145,6 +145,8 @@ For required text entry, supply `--fixtures fixtures.json`, a JSON object mappin
 
 The planner can observe, read/search loaded rendered text without scrolling, navigate, request an eight-action subgoal, complete, or block. Reads paginate at 6,000 characters and disclose scan limits; hidden text and editable values are excluded. A search miss is not proof of absence, especially with lazy-loaded or embedded content.
 
+Exploration plans complete outcomes rather than individual clicks. The host planner receives current page text capped at 3,000 characters, compact semantic controls, role/count summaries for offscreen controls, and the last eight progress summaries instead of replayed page snapshots. Disabled, occluded, and invalid-field context stays explicit; `read` and scrolling recover additional content. Full observations remain in the report. Jev still makes one batched request per decision, but skips redundant target questions when an operation has exactly one compatible target; inferred targets have no fabricated confidence score.
+
 Progress memory survives subgoals and ignores node-ID/geometry churn. Repeated no-change waits, empty scrolling, action cycles, or a subgoal limit return safe checkpoints to the planner; a third checkpoint blocks. Only stale observations detected **before input** can refresh, at most twice before a checkpoint. Denied requests, low-confidence choices, and ambiguous writes stop rather than being replanned or resubmitted.
 
 Chrome accessibility metadata supplies names, scope context, popup options, and active options. Disabled, offscreen, or occluded controls are context, never executable targets. Accessibility failures use an explicitly reported DOM-only observation; native selects, shadow-root controls, frames, and popups remain unsupported. Keyboard input revalidates and focuses the observed element; container scrolling uses its freshly hit-tested position.
@@ -162,6 +164,8 @@ jev-qa explore --goal-only --url https://www.youtube.com/ \
 ```
 
 No policy file, origin/method allowlist, or fixture file is required. The host planner derives text-entry values from the goal and may navigate to new HTTP(S) destinations. Explicit caller fixtures, if supplied, cannot be overwritten. The numeric confidence gate is disabled; incomplete network capture is reported rather than treated as contract failure. This mode can change real account data.
+
+Goal-only Codex planning uses low reasoning effort and groups work into outcome-based subgoals of up to eight actions. This reduces planning overhead; it does not guarantee a fixed task latency, which also depends on the selected model, provider, page, and browser.
 
 Opting in permits page text and action-history disclosure to Jev and the selected host planner. Request/response bodies are not enabled for model disclosure; screenshots remain opt-in. Existing-profile attachment still requires explicit `--attach-profile NAME --cdp-url ENDPOINT`; otherwise Chrome uses an isolated profile. Sign in yourself when a task requires an authenticated account.
 
