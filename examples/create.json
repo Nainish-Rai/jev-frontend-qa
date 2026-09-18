@@ -1,0 +1,96 @@
+{
+  "scenario_version": "1",
+  "name": "create-todo-through-jev",
+  "description": "UI creation with exact payload, correlated record ID, DOM state, independent post-reload persistence, and scoped cleanup.",
+  "start_url": "http://127.0.0.1:8767/",
+  "steps": [
+    {
+      "id": "create",
+      "goal": "Create exactly one todo using the supplied title '{{title}}'. Stop after the UI responds; do not retry an ambiguous submission.",
+      "fixtures": {
+        "title": "qa-run-{{run_id}}"
+      },
+      "scope": {
+        "css": "#create-form"
+      },
+      "reload_after": true,
+      "assertions": [
+        {
+          "kind": "network",
+          "method": "POST",
+          "path": "/api/todos",
+          "expected_status": 201,
+          "payload_contains": {
+            "title": "qa-run-{{run_id}}"
+          },
+          "response_contains": {
+            "todo": {
+              "title": "qa-run-{{run_id}}",
+              "completed": false
+            }
+          },
+          "capture": {
+            "todo_id": "$.todo.id"
+          }
+        },
+        {
+          "kind": "equals",
+          "selector": {
+            "css": "[data-todo-id=\"{{todo_id}}\"] [data-testid=\"todo-title\"]"
+          },
+          "expected": "qa-run-{{run_id}}"
+        },
+        {
+          "kind": "attribute",
+          "selector": {
+            "css": "[data-todo-id=\"{{todo_id}}\"]"
+          },
+          "name": "data-completed",
+          "expected": "false"
+        },
+        {
+          "kind": "persistence",
+          "method": "GET",
+          "path": "/api/todos",
+          "records_path": "$.todos",
+          "contains": {
+            "id": "{{todo_id}}",
+            "title": "qa-run-{{run_id}}",
+            "completed": false
+          },
+          "absent": false
+        }
+      ]
+    }
+  ],
+  "cleanup": [
+    {
+      "id": "cleanup-owned-todo",
+      "goal": "Delete only the run-owned todo with ID {{todo_id}} within the scoped row. Never touch any other row. Do not retry an ambiguous deletion.",
+      "scope": {
+        "css": "[data-todo-id=\"{{todo_id}}\"]"
+      },
+      "skip_if_absent": true,
+      "reload_after": true,
+      "assertions": [
+        {
+          "kind": "count",
+          "selector": {
+            "css": "[data-todo-id=\"{{todo_id}}\"]"
+          },
+          "expected": 0
+        },
+        {
+          "kind": "persistence",
+          "method": "GET",
+          "path": "/api/todos",
+          "records_path": "$.todos",
+          "contains": {
+            "id": "{{todo_id}}"
+          },
+          "absent": true
+        }
+      ]
+    }
+  ]
+}

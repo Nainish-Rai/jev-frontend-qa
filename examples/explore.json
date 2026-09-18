@@ -1,0 +1,17 @@
+{
+  "scenario_version": "1",
+  "name": "inspect-synthetic-todo-demo",
+  "mode": "exploratory",
+  "description": "Inspect the synthetic demo without inventing expected behavior or mutating records.",
+  "start_url": "http://127.0.0.1:8767/",
+  "steps": [
+    {
+      "id": "inspect-controls",
+      "goal": "Inspect the visible todo page, identify the available create and lifecycle controls, and finish. Do not fill fields, create records, or mutate existing records. Report BLOCKED if an unsupported interaction is required."
+    }
+  ],
+  "limits": {
+    "max_actions": 8,
+    "max_seconds": 30
+  }
+}

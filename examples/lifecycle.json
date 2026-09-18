@@ -1,0 +1,293 @@
+{
+  "scenario_version": "1",
+  "name": "todo-lifecycle",
+  "description": "One UUID-owned record: create, edit, complete, uncomplete, delete. Each stage checks UI, network and independent fresh state; no unrelated row is changed.",
+  "start_url": "http://127.0.0.1:8767/",
+  "steps": [
+    {
+      "id": "create",
+      "goal": "Create exactly one todo using the supplied title '{{title}}'. Stop after the UI responds; do not retry an ambiguous submission.",
+      "fixtures": {
+        "title": "qa-run-{{run_id}}"
+      },
+      "scope": {
+        "css": "#create-form"
+      },
+      "reload_after": true,
+      "assertions": [
+        {
+          "kind": "network",
+          "method": "POST",
+          "path": "/api/todos",
+          "expected_status": 201,
+          "payload_contains": {
+            "title": "qa-run-{{run_id}}"
+          },
+          "response_contains": {
+            "todo": {
+              "title": "qa-run-{{run_id}}",
+              "completed": false
+            }
+          },
+          "capture": {
+            "todo_id": "$.todo.id"
+          }
+        },
+        {
+          "kind": "equals",
+          "selector": {
+            "css": "[data-todo-id=\"{{todo_id}}\"] [data-testid=\"todo-title\"]"
+          },
+          "expected": "qa-run-{{run_id}}"
+        },
+        {
+          "kind": "attribute",
+          "selector": {
+            "css": "[data-todo-id=\"{{todo_id}}\"]"
+          },
+          "name": "data-completed",
+          "expected": "false"
+        },
+        {
+          "kind": "persistence",
+          "method": "GET",
+          "path": "/api/todos",
+          "records_path": "$.todos",
+          "contains": {
+            "id": "{{todo_id}}",
+            "title": "qa-run-{{run_id}}",
+            "completed": false
+          },
+          "absent": false
+        }
+      ]
+    },
+    {
+      "id": "edit",
+      "goal": "Edit the scoped todo {{todo_id}} to the exact supplied title '{{title}}' and save once.",
+      "scope": {
+        "css": "[data-todo-id=\"{{todo_id}}\"]"
+      },
+      "fixtures": {
+        "title": "qa-run-{{run_id}}-edited"
+      },
+      "reload_after": true,
+      "assertions": [
+        {
+          "kind": "network",
+          "method": "PATCH",
+          "path": "/api/todos/{{todo_id}}",
+          "expected_status": 200,
+          "payload_contains": {
+            "title": "qa-run-{{run_id}}-edited"
+          },
+          "response_contains": {
+            "todo": {
+              "id": "{{todo_id}}",
+              "title": "qa-run-{{run_id}}-edited",
+              "completed": false
+            }
+          }
+        },
+        {
+          "kind": "equals",
+          "selector": {
+            "css": "[data-todo-id=\"{{todo_id}}\"] [data-testid=\"todo-title\"]"
+          },
+          "expected": "qa-run-{{run_id}}-edited"
+        },
+        {
+          "kind": "attribute",
+          "selector": {
+            "css": "[data-todo-id=\"{{todo_id}}\"]"
+          },
+          "name": "data-completed",
+          "expected": "false"
+        },
+        {
+          "kind": "persistence",
+          "method": "GET",
+          "path": "/api/todos",
+          "records_path": "$.todos",
+          "contains": {
+            "id": "{{todo_id}}",
+            "title": "qa-run-{{run_id}}-edited",
+            "completed": false
+          },
+          "absent": false
+        }
+      ]
+    },
+    {
+      "id": "complete",
+      "goal": "Mark the scoped todo {{todo_id}} complete once.",
+      "scope": {
+        "css": "[data-todo-id=\"{{todo_id}}\"]"
+      },
+      "fixtures": {},
+      "reload_after": true,
+      "assertions": [
+        {
+          "kind": "network",
+          "method": "PATCH",
+          "path": "/api/todos/{{todo_id}}",
+          "expected_status": 200,
+          "payload_contains": {
+            "completed": true
+          },
+          "response_contains": {
+            "todo": {
+              "id": "{{todo_id}}",
+              "title": "qa-run-{{run_id}}-edited",
+              "completed": true
+            }
+          }
+        },
+        {
+          "kind": "equals",
+          "selector": {
+            "css": "[data-todo-id=\"{{todo_id}}\"] [data-testid=\"todo-title\"]"
+          },
+          "expected": "qa-run-{{run_id}}-edited"
+        },
+        {
+          "kind": "attribute",
+          "selector": {
+            "css": "[data-todo-id=\"{{todo_id}}\"]"
+          },
+          "name": "data-completed",
+          "expected": "true"
+        },
+        {
+          "kind": "persistence",
+          "method": "GET",
+          "path": "/api/todos",
+          "records_path": "$.todos",
+          "contains": {
+            "id": "{{todo_id}}",
+            "title": "qa-run-{{run_id}}-edited",
+            "completed": true
+          },
+          "absent": false
+        }
+      ]
+    },
+    {
+      "id": "uncomplete",
+      "goal": "Mark the scoped todo {{todo_id}} active (uncomplete) once.",
+      "scope": {
+        "css": "[data-todo-id=\"{{todo_id}}\"]"
+      },
+      "fixtures": {},
+      "reload_after": true,
+      "assertions": [
+        {
+          "kind": "network",
+          "method": "PATCH",
+          "path": "/api/todos/{{todo_id}}",
+          "expected_status": 200,
+          "payload_contains": {
+            "completed": false
+          },
+          "response_contains": {
+            "todo": {
+              "id": "{{todo_id}}",
+              "title": "qa-run-{{run_id}}-edited",
+              "completed": false
+            }
+          }
+        },
+        {
+          "kind": "equals",
+          "selector": {
+            "css": "[data-todo-id=\"{{todo_id}}\"] [data-testid=\"todo-title\"]"
+          },
+          "expected": "qa-run-{{run_id}}-edited"
+        },
+        {
+          "kind": "attribute",
+          "selector": {
+            "css": "[data-todo-id=\"{{todo_id}}\"]"
+          },
+          "name": "data-completed",
+          "expected": "false"
+        },
+        {
+          "kind": "persistence",
+          "method": "GET",
+          "path": "/api/todos",
+          "records_path": "$.todos",
+          "contains": {
+            "id": "{{todo_id}}",
+            "title": "qa-run-{{run_id}}-edited",
+            "completed": false
+          },
+          "absent": false
+        }
+      ]
+    },
+    {
+      "id": "delete",
+      "goal": "Delete only the scoped todo with ID {{todo_id}} once.",
+      "scope": {
+        "css": "[data-todo-id=\"{{todo_id}}\"]"
+      },
+      "reload_after": true,
+      "assertions": [
+        {
+          "kind": "network",
+          "method": "DELETE",
+          "path": "/api/todos/{{todo_id}}",
+          "expected_status": 204
+        },
+        {
+          "kind": "count",
+          "selector": {
+            "css": "[data-todo-id=\"{{todo_id}}\"]"
+          },
+          "expected": 0
+        },
+        {
+          "kind": "persistence",
+          "method": "GET",
+          "path": "/api/todos",
+          "records_path": "$.todos",
+          "contains": {
+            "id": "{{todo_id}}"
+          },
+          "absent": true
+        }
+      ]
+    }
+  ],
+  "cleanup": [
+    {
+      "id": "cleanup-owned-todo",
+      "goal": "Delete only the run-owned todo with ID {{todo_id}} within the scoped row. Never touch any other row. Do not retry an ambiguous deletion.",
+      "scope": {
+        "css": "[data-todo-id=\"{{todo_id}}\"]"
+      },
+      "skip_if_absent": true,
+      "reload_after": true,
+      "assertions": [
+        {
+          "kind": "count",
+          "selector": {
+            "css": "[data-todo-id=\"{{todo_id}}\"]"
+          },
+          "expected": 0
+        },
+        {
+          "kind": "persistence",
+          "method": "GET",
+          "path": "/api/todos",
+          "records_path": "$.todos",
+          "contains": {
+            "id": "{{todo_id}}"
+          },
+          "absent": true
+        }
+      ]
+    }
+  ]
+}

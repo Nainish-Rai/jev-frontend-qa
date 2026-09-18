@@ -1,0 +1,21 @@
+{
+  "policy_version": "1",
+  "network": {
+    "allowed_origins": [
+      {"origin": "http://127.0.0.1:8767", "methods": ["GET", "POST", "PATCH", "DELETE"], "path_prefix": "/api/todos"},
+      {"origin": "http://127.0.0.1:8767", "methods": ["GET"], "path_prefix": "/"}
+    ]
+  },
+  "model_disclosure": {
+    "allow_page_text": true,
+    "allow_action_history": true,
+    "allow_request_bodies": true,
+    "allow_response_bodies": true,
+    "allow_screenshots": false
+  },
+  "identity": {"mode": "attach", "attach_profile_name": "synthetic-demo"},
+  "redaction": {
+    "redact_headers": ["authorization", "cookie", "set-cookie", "x-api-key"],
+    "redact_body_fields": ["password", "token", "secret", "apiKey"]
+  }
+}

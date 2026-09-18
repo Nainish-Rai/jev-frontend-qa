@@ -1,0 +1,120 @@
+{
+  "scenario_version": "1",
+  "name": "todo-client-validation",
+  "description": "UI rejection of blank and whitespace fixtures, with no POST in each settled action window and no invalid record in a post-reload fresh collection. Direct API validation remains separate API coverage.",
+  "start_url": "http://127.0.0.1:8767/",
+  "steps": [
+    {
+      "id": "reject-blank",
+      "goal": "Replace the Todo title input with the exact supplied title fixture, including all whitespace or an empty string. Click Create todo once, then stop when the UI reports invalid title. This checks client-side rejection, not a direct API request.",
+      "fixtures": {
+        "title": ""
+      },
+      "scope": {
+        "css": "#create-form"
+      },
+      "reload_after": true,
+      "assertions": [
+        {
+          "kind": "attribute",
+          "selector": {
+            "css": "#create-input"
+          },
+          "name": "aria-invalid",
+          "expected": "true"
+        },
+        {
+          "kind": "attribute",
+          "selector": {
+            "css": "#create-status"
+          },
+          "name": "data-state",
+          "expected": "error"
+        },
+        {
+          "kind": "equals",
+          "selector": {
+            "css": "#create-status"
+          },
+          "expected": "Title must not be blank or whitespace only."
+        },
+        {
+          "kind": "no_request",
+          "method": "POST",
+          "path": "/api/todos"
+        },
+        {
+          "kind": "persistence",
+          "method": "GET",
+          "path": "/api/todos",
+          "records_path": "$.todos",
+          "contains": {
+            "title": ""
+          },
+          "absent": true
+        }
+      ]
+    },
+    {
+      "id": "reject-whitespace",
+      "goal": "Replace the Todo title input with the exact supplied title fixture, including all whitespace or an empty string. Click Create todo once, then stop when the UI reports invalid title. This checks client-side rejection, not a direct API request.",
+      "fixtures": {
+        "title": "   "
+      },
+      "scope": {
+        "css": "#create-form"
+      },
+      "reload_after": true,
+      "assertions": [
+        {
+          "kind": "attribute",
+          "selector": {
+            "css": "#create-input"
+          },
+          "name": "aria-invalid",
+          "expected": "true"
+        },
+        {
+          "kind": "attribute",
+          "selector": {
+            "css": "#create-status"
+          },
+          "name": "data-state",
+          "expected": "error"
+        },
+        {
+          "kind": "equals",
+          "selector": {
+            "css": "#create-status"
+          },
+          "expected": "Title must not be blank or whitespace only."
+        },
+        {
+          "kind": "no_request",
+          "method": "POST",
+          "path": "/api/todos"
+        },
+        {
+          "kind": "persistence",
+          "method": "GET",
+          "path": "/api/todos",
+          "records_path": "$.todos",
+          "contains": {
+            "title": "   "
+          },
+          "absent": true
+        },
+        {
+          "kind": "persistence",
+          "method": "GET",
+          "path": "/api/todos",
+          "records_path": "$.todos",
+          "contains": {
+            "title": ""
+          },
+          "absent": true
+        }
+      ]
+    }
+  ]
+}

@@ -6,7 +6,7 @@ server is intentionally small (stdlib `http.server` + `sqlite3`) so the tester
 can drive it end-to-end without introducing framework dependencies.
 
 Public surface:
-    * `create_server(host, port, database)` -- returns an `HTTPServer` instance
+    * `create_server(host, port, database, variant="healthy")` -- returns an `HTTPServer` instance
       bound to a SQLite database file. The caller decides whether to call
       `serve_forever()` or drive the instance manually.
     * `main(argv=None)` -- the `jev-todo` console script entry point.
@@ -30,17 +30,19 @@ import sqlite3
 import sys
 import threading
 import uuid
-from datetime import datetime, timezone
+from collections.abc import Iterable, Mapping
+from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 _LOGGER = logging.getLogger("jev_frontend_qa.demo")
 _MAX_TITLE_LENGTH = 500
 _STATIC_ROOT = Path(__file__).parent / "demo_static"
 _INDEX_FILE = "index.html"
 _STATIC_CACHE_CONTROL = "no-cache"
+_VARIANTS = ("healthy", "fake-success", "incorrect-payload", "lost-save")
 
 # SQL statements are module-level constants so they are easy to audit; every
 # query uses parameter binding.
@@ -52,13 +54,9 @@ CREATE TABLE IF NOT EXISTS todos (
     created_at TEXT NOT NULL
 );
 """
-_INSERT_SQL = (
-    "INSERT INTO todos (id, title, completed, created_at) VALUES (?, ?, 0, ?)"
-)
+_INSERT_SQL = "INSERT INTO todos (id, title, completed, created_at) VALUES (?, ?, 0, ?)"
 _SELECT_ALL_SQL = "SELECT id, title, completed FROM todos ORDER BY rowid ASC"
-_SELECT_ONE_SQL = (
-    "SELECT id, title, completed FROM todos WHERE id = ?"
-)
+_SELECT_ONE_SQL = "SELECT id, title, completed FROM todos WHERE id = ?"
 _UPDATE_TITLE_SQL = "UPDATE todos SET title = ? WHERE id = ?"
 _UPDATE_COMPLETED_SQL = "UPDATE todos SET completed = ? WHERE id = ?"
 _UPDATE_BOTH_SQL = "UPDATE todos SET title = ?, completed = ? WHERE id = ?"
@@ -72,7 +70,6 @@ class TodoStore:
         self._database = Path(database)
         self._lock = threading.Lock()
         self._initialise_schema()
-
 
     def _connect(self) -> sqlite3.Connection:
         self._database.parent.mkdir(parents=True, exist_ok=True)
@@ -90,12 +87,15 @@ class TodoStore:
             rows = connection.execute(_SELECT_ALL_SQL).fetchall()
         return [_row_to_todo(row) for row in rows]
 
-    def create_todo(self, title: str) -> dict[str, Any]:
+    def create_todo(self, title: str, *, persist: bool = True) -> dict[str, Any]:
         todo_id = str(uuid.uuid4())
         created_at = _now_iso()
         with self._lock, contextlib.closing(self._connect()) as connection:
+            connection.execute("BEGIN")
             connection.execute(_INSERT_SQL, (todo_id, title, created_at))
             row = connection.execute(_SELECT_ONE_SQL, (todo_id,)).fetchone()
+            # The lost-save demo returns the inserted row but loses the transaction.
+            connection.execute("COMMIT" if persist else "ROLLBACK")
         assert row is not None  # we just inserted it
         return _row_to_todo(row)
 
@@ -122,15 +122,11 @@ class TodoStore:
             if existing is None:
                 return {"missing": True}
             if title is not None and completed is not None:
-                connection.execute(
-                    _UPDATE_BOTH_SQL, (title, 1 if completed else 0, todo_id)
-                )
+                connection.execute(_UPDATE_BOTH_SQL, (title, 1 if completed else 0, todo_id))
             elif title is not None:
                 connection.execute(_UPDATE_TITLE_SQL, (title, todo_id))
             elif completed is not None:
-                connection.execute(
-                    _UPDATE_COMPLETED_SQL, (1 if completed else 0, todo_id)
-                )
+                connection.execute(_UPDATE_COMPLETED_SQL, (1 if completed else 0, todo_id))
             else:
                 return {"missing": False, "no_op": True}
             row = connection.execute(_SELECT_ONE_SQL, (todo_id,)).fetchone()
@@ -145,7 +141,7 @@ class TodoStore:
 
 def _now_iso() -> str:
     """Return the current UTC timestamp formatted as ISO 8601 with `Z`."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _row_to_todo(row: sqlite3.Row) -> dict[str, Any]:
@@ -156,28 +152,28 @@ def _row_to_todo(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _make_handler(store: TodoStore) -> type[BaseHTTPRequestHandler]:
-    """Build a handler class bound to the given store."""
+def _make_handler(store: TodoStore, variant: str) -> type[BaseHTTPRequestHandler]:
+    """Bind the real API and demo-only fault behavior to one server instance."""
 
     class TodoHandler(BaseHTTPRequestHandler):
         server_version = "JevFrontendQADemo/0.1"
 
         # Silence the default per-request stderr access log; the demo is meant
         # to be quiet when running interactively. Uncomment to debug routing.
-        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        def log_message(self, format: str, *args: Any) -> None:
             _LOGGER.debug(format, *args)
 
         # -- Request dispatch -------------------------------------------------
-        def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+        def do_GET(self) -> None:
             self._dispatch("GET")
 
-        def do_POST(self) -> None:  # noqa: N802
+        def do_POST(self) -> None:
             self._dispatch("POST")
 
-        def do_PATCH(self) -> None:  # noqa: N802
+        def do_PATCH(self) -> None:
             self._dispatch("PATCH")
 
-        def do_DELETE(self) -> None:  # noqa: N802
+        def do_DELETE(self) -> None:
             self._dispatch("DELETE")
 
         # -- Dispatch ---------------------------------------------------------
@@ -193,7 +189,7 @@ def _make_handler(store: TodoStore) -> type[BaseHTTPRequestHandler]:
         def _route(self, method: str) -> None:
             path = self.path.split("?", 1)[0]
             if path == "/health" and method == "GET":
-                self._write_json(HTTPStatus.OK, {"status": "ok"})
+                self._write_json(HTTPStatus.OK, {"status": "ok", "variant": variant})
                 return
             if path in {"/", "/styles.css", "/app.js"} and method == "GET":
                 self._serve_static(path)
@@ -202,7 +198,7 @@ def _make_handler(store: TodoStore) -> type[BaseHTTPRequestHandler]:
                 self._handle_collection(method)
                 return
             if path.startswith("/api/todos/"):
-                self._handle_item(method, path[len("/api/todos/"):])
+                self._handle_item(method, path[len("/api/todos/") :])
                 return
             raise _ClientError(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -220,6 +216,12 @@ def _make_handler(store: TodoStore) -> type[BaseHTTPRequestHandler]:
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     f"Demo assets missing: {error.filename}",
                 ) from error
+            if filename == _INDEX_FILE:
+                body = body.replace(
+                    b'data-demo-variant="healthy"',
+                    f'data-demo-variant="{variant}"'.encode(),
+                    1,
+                )
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
@@ -235,7 +237,9 @@ def _make_handler(store: TodoStore) -> type[BaseHTTPRequestHandler]:
             if method == "POST":
                 payload = self._read_json_body()
                 title = _validate_title(payload.get("title"))
-                todo = store.create_todo(title)
+                if variant == "fake-success":
+                    raise _ClientError(HTTPStatus.SERVICE_UNAVAILABLE, "Todo write rejected")
+                todo = store.create_todo(title, persist=variant != "lost-save")
                 self._write_json(HTTPStatus.CREATED, {"todo": todo})
                 return
             self._method_not_allowed({"GET", "POST"})
@@ -402,8 +406,16 @@ def _validate_id(value: str) -> str:
     return candidate
 
 
+def _variant_database(database: Path, variant: str) -> Path:
+    if variant not in _VARIANTS:
+        raise ValueError(f"Unknown demo variant: {variant}")
+    if variant == "healthy":
+        return database
+    return database.with_name(f"{database.stem}.{variant}{database.suffix}")
+
+
 # -- Public factory ------------------------------------------------------------
-def create_server(host: str, port: int, database: Path) -> ThreadingHTTPServer:
+def create_server(host: str, port: int, database: Path, *, variant: str = "healthy") -> ThreadingHTTPServer:
     """Build a `ThreadingHTTPServer` bound to the supplied loopback address.
 
     Args:
@@ -412,14 +424,17 @@ def create_server(host: str, port: int, database: Path) -> ThreadingHTTPServer:
         port: TCP port. `0` lets the OS pick a free port, which is useful for
             tests that exercise the API without coordinating ports.
         database: Path to the SQLite file. The parent directory is created if
-            it does not exist.
+            it does not exist. Fault variants add their name before the suffix
+            so the same base path cannot share healthy and defective state.
+        variant: Demo-only behavior selected from healthy, fake-success,
+            incorrect-payload, or lost-save.
 
     Returns:
         A `ThreadingHTTPServer` instance ready to be passed to
         `serve_forever()` or driven manually.
     """
-    store = TodoStore(Path(database))
-    handler = _make_handler(store)
+    store = TodoStore(_variant_database(Path(database), variant))
+    handler = _make_handler(store, variant)
     # ThreadingHTTPServer supports per-request handler instantiation; the
     # handler closes over `store` via the enclosing closure.
     server = ThreadingHTTPServer((host, port), handler)
@@ -452,7 +467,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--database",
         type=Path,
         default=Path("artifacts") / "todo.sqlite3",
-        help="SQLite database file (default: artifacts/todo.sqlite3)",
+        help="Base SQLite path; fault variants add a variant suffix (default: artifacts/todo.sqlite3)",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=_VARIANTS,
+        default="healthy",
+        help="Demo-only fault variant (default: healthy)",
     )
     parser.add_argument(
         "--quiet",
@@ -474,13 +495,13 @@ def main(argv: list[str] | None = None) -> int:
     database = args.database.expanduser()
     database.parent.mkdir(parents=True, exist_ok=True)
 
-    httpd = create_server(args.host, args.port, database)
+    httpd = create_server(args.host, args.port, database, variant=args.variant)
     bound_host, bound_port = httpd.server_address[0], httpd.server_address[1]
 
     if not args.quiet:
         print(
             f"jev-todo listening on http://{bound_host}:{bound_port} "
-            f"(database: {database})",
+            f"(variant: {args.variant}; database: {_variant_database(database, args.variant)})",
             file=sys.stderr,
             flush=True,
         )

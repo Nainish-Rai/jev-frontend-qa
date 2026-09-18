@@ -1,10 +1,8 @@
 /* Synthetic Todo — frontend behaviour.
  *
- * Speaks only to /api/todos. All persistence flows through the backend so the
- * QA runner can observe real requests and verify real state, not in-memory
- * copies that vanish on reload. The UI is intentionally minimal: every
- * action is a real fetch() call, every error surfaces in a live region so the
- * runner (or a human with a screen reader) can see what happened.
+ * Every mutation still makes a real /api/todos request. Demo-only variants
+ * deliberately contradict that evidence in the create UI or discard a save
+ * server-side; the QA runner must check requests and fresh state independently.
  */
 
 (() => {
@@ -12,6 +10,7 @@
 
   const API_BASE = "/api/todos";
   const MAX_TITLE_LENGTH = 500;
+  const DEMO_VARIANT = document.documentElement.dataset.demoVariant;
 
   // -- DOM lookups ------------------------------------------------------------
   const createForm = document.getElementById("create-form");
@@ -169,6 +168,24 @@
   }
 
   // -- Create -----------------------------------------------------------------
+  async function createTodo(title) {
+    // Faults live only in the demo, never in the tester's expected contract.
+    const submittedTitle = DEMO_VARIANT === "incorrect-payload"
+      ? (title.startsWith("!") ? "?" : "!") + title.slice(title.codePointAt(0) > 0xffff ? 2 : 1)
+      : title;
+    try {
+      const { todo } = await api("", {
+        method: "POST",
+        body: { title: submittedTitle },
+      });
+      return DEMO_VARIANT === "incorrect-payload" ? { ...todo, title } : todo;
+    } catch (error) {
+      if (DEMO_VARIANT !== "fake-success" || error.status !== 503) throw error;
+      // A deliberately fabricated UI row, despite the observed API rejection.
+      return { id: crypto.randomUUID(), title, completed: false };
+    }
+  }
+
   async function submitCreate(event) {
     event.preventDefault();
     const title = createInput.value;
@@ -186,10 +203,7 @@
     clearStatus(createStatus);
     createSubmit.disabled = true;
     try {
-      const { todo } = await api("", {
-        method: "POST",
-        body: { title: title.trim() },
-      });
+      const todo = await createTodo(title.trim());
       createInput.value = "";
       addRow(todo);
       setStatus(createStatus, `Created “${todo.title}”.`, "ok");
