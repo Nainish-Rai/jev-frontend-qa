@@ -4,7 +4,73 @@ Evidence-driven frontend QA built on [Jev Ultrafast](https://github.com/browser-
 
 **Status: live Jev acceptance passed for the synthetic reference scenarios.** The real CLI, Jev `1.13.0`, Browser Harness, Chrome, HTTP endpoints, and SQLite were exercised together. Healthy creation, lifecycle, and validation passed; all three deliberate defects failed their authored contracts; exploration completed without claiming a contract PASS. There is no offline-model fallback in the production CLI.
 
-## Use from Claude Code or Codex
+## Current features
+
+- **Real browser QA:** visible Chrome by default, optional headless execution, isolated profiles, and explicit policy-approved attachment.
+- **Bounded Jev decisions:** typed operation/target choices over observed controls; exact fixture values and correctness checks remain in code.
+- **Contract and exploratory runs:** check DOM state, correlated HTTP requests/responses, absent requests, and fresh persistence reads; exploration never implies a contract PASS.
+- **Portable coding-agent skill:** Claude Code or Codex can author feature-specific scenarios and run the same CLI. No Todo-specific workflow is required.
+- **Configurable screenshots:** all lifecycle states, every action, step outcomes, failures only, or every Nth action; private local PNGs.
+- **Session accounting:** duration, actions, assertions, screenshots, Jev calls/latency/tokens, and estimated cost in the terminal and JSON report.
+- **Safety controls:** deny-default policy, redaction, run-owned cleanup, bounded time/actions, and no automatic retry of ambiguous writes.
+
+## How Jev works in this CLI
+
+**Jev is the action selector, not the test author or the correctness judge.** Claude/Codex (or a human) supplies a scenario and policy. The CLI then runs independently; you do not need a coding agent connected while a scenario executes.
+
+```text
+Human / Claude / Codex
+        |
+        v
+Scenario + approved policy
+        |
+        v
+Python runner observes Chrome through Browser Harness
+        |
+        v
+Approved, redacted page state + goal + bounded choices
+        |
+        v
+Jev / TypeSafe chooses operation + observed target
+        |
+        v
+Python validates choice, confidence, scope, and permissions
+        |
+        v
+Browser Harness executes input; runner collects evidence
+        |
+        +---- observe again if more interaction is needed
+        |
+        v
+Deterministic assertions + fresh reads -> verdict + report
+```
+
+1. **Load and authorize.** The CLI validates the scenario/policy, checks credentials and disclosure permissions, and starts a private browser session unless explicitly authorized to attach.
+2. **Observe.** Local snapshot code reads page text and visible controls, including field values, validation/toggle state, and scoped offscreen scroll hints. An authored scope restricts which record/form Jev can act on.
+3. **Ask Jev once per decision.** [`ModelClient`](src/jev_frontend_qa/core/model_client.py) sends one HTTP request to `POST https://api.typesafe.ai/v1/systemone`, using `jev-1.13.0` by default. The request batches an operation question and target questions for available element operations. Supported executable choices are clicks, exact-fixture text entry, scrolling, and waiting, plus `DONE`/`BLOCKED`.
+4. **Accept only a valid offered choice.** The response includes typed choices, probability distributions, and confidence. Code validates the answer against the offered choices and uses the selected operation/target confidence—not confidence for unrelated target questions. The default action threshold is `0.55`; low confidence stops the run as BLOCKED.
+5. **Execute locally.** [`Runner`](src/jev_frontend_qa/core/agent.py) resolves exact input text from scenario fixtures and dispatches through [Browser Harness](src/jev_frontend_qa/core/browser.py). Jev does not generate selectors, JavaScript, field values, or unrestricted tool calls. After input, the runner waits for network evidence to settle before making another decision.
+6. **Verify independently.** Jev's `DONE` means “stop interacting,” not “the test passed.” Authored assertions check the actual DOM and HTTP evidence; persistence assertions perform fresh authorized reads. Conclusive contract evidence can trigger verification without an extra `DONE` call. Only these checks establish a contract verdict.
+7. **Clean up and report.** Where safe, the runner drives authored cleanup scoped to verified run-owned records, closes its owned resources, and writes the report, screenshots, and usage totals.
+
+**Example: creating a Todo.** The scenario supplies `qa-run-{{run_id}}`. Jev chooses the title field and then the submit button. Python fills the exact title, checks the actual POST payload and response, captures that response's record ID, checks that specific row, reloads and reads persistence, then deletes only the owned record. A success toast with no saved record fails the contract even if Jev thinks the interaction is finished.
+
+### What leaves the machine?
+
+Jev receives permitted, redacted structured page observations, the current step goal and supplied fixtures, and up to ten recent actions when action-history disclosure is enabled. It receives **text/structured state, not screenshot pixels**. The request does not include captured HTTP request/response bodies; those are local assertion evidence governed by policy and redaction. Do not put real secrets or personal data in test fixtures.
+
+Browser input, assertions, captured evidence, screenshots, and reports stay under local runner control. Screenshots are unredacted and require explicit policy permission. Host-agent usage from Claude/Codex is separate from the Jev usage reported by this CLI.
+
+## Getting started
+
+**Prerequisites:** Python 3.12+, [uv](https://docs.astral.sh/uv/), Chrome/Chromium, and a TypeSafe API key for live runs. Schema, initialization, scenario registration, and validation commands need neither an API key nor a running browser.
+
+Choose one path:
+
+- **Your own app:** install the CLI and optional skill below, start your app, then authorize its origins and author a contract.
+- **A ready-to-run example:** use the [synthetic demo walkthrough](#try-the-synthetic-demo-from-source), which includes complete scenarios and a narrowly scoped policy.
+
+### Use from Claude Code or Codex
 
 Install the CLI independently of your application's Python environment:
 
@@ -27,11 +93,21 @@ The installer copies the same bundled `jevqa` skill to `.claude/skills/jevqa/` f
 
 Initialization creates `jevqa/policy.json` with **no permitted origins or model disclosure**, a scenarios directory, and an ignore entry for `artifacts/jevqa/`. Existing policies are preserved. Review and explicitly approve the app's origins, HTTP operations, and permitted synthetic observations before a run. Skill installation is not that approval.
 
+Configure `TYPESAFE_API_KEY` privately in the environment where `jev-qa run` will execute, or in a gitignored `.env` in that command's working directory. Restrict `.env` with `chmod 600 .env`; an existing environment variable takes precedence. Never put the key in a scenario, policy, prompt, or committed file.
+
+Start your application separately. The CLI does not start your app server. In `jevqa/policy.json`, approve only the required origins, HTTP methods/path prefixes, and synthetic observations. Keep the scenario's `start_url` consistent with that policy. An initialized, unchanged policy intentionally blocks a live run.
+
 Then ask your coding agent, for example:
 
 > Use jevqa to verify the feature we just implemented. Derive journeys from the acceptance criteria, identify supported and blocked coverage, author exact fixtures and assertions, and run against the approved local app. Preserve the expected behavior when investigating failures.
 
 In Claude Code you can invoke `/jevqa`; in Codex CLI use `$jevqa` or select it through `/skills`. The workflow is feature-agnostic: no Todo routes, CRUD checklist, or database is required. The coding agent authors the contract; Jev operates the browser; deterministic checks establish the verdict.
+
+To choose capture behavior through the skill, add “screenshots after every action,” “step outcomes only,” “failures only,” or “every third action” to the prompt. The skill maps these to CLI flags; it must not expand policy permission. For example:
+
+> Use jevqa to verify the search acceptance criteria against our approved local app. Run Chrome visibly, capture failures only if policy permits, and report the verdict, coverage gaps, screenshot paths, Jev tokens, and estimated cost.
+
+After updating the CLI with `uv tool upgrade jev-frontend-qa`, refresh any previously installed skill deliberately: the installer refuses overwrites. Preserve local skill edits before replacing the installed `jevqa` directory and rerunning `skill install`.
 
 The agent can inspect the actual installed schemas and register a complete, authored contract:
 
@@ -49,18 +125,34 @@ jev-qa run --scenario jevqa/scenarios/search/filter.json --policy jevqa/policy.j
 
 **Coverage limits:** current assertions cover DOM values/counts/attributes, captured HTTP exchanges, absence of a request, and authorized fresh GET persistence. Download/file-content validation, uploads, URL-transition assertions, visual grading, native selects, embedded frames, and popup workflows are not supported contracts. The skill reports required unsupported coverage as BLOCKED; a passing supported subset is not a full-feature PASS. Page instructions are untrusted data, and the agent cannot expand project permissions to satisfy them.
 
-## Run the synthetic demo
+### Try the synthetic demo from source
+
+Clone the repository and install its dependencies:
 
 ```bash
+git clone https://github.com/Nainish-Rai/jev-frontend-qa.git
+cd jev-frontend-qa
 uv sync
+```
+
+Configure the key in your environment, or prepare a local file **only if `.env` does not already exist**:
+
+```bash
+cp -n .env.example .env
+chmod 600 .env
+```
+
+Edit the file privately to set `TYPESAFE_API_KEY`. Keep it out of version control. Start the synthetic app in this terminal:
+
+```bash
 uv run jev-todo --port 8767 --database artifacts/todo.sqlite3
 ```
 
 Open `http://127.0.0.1:8767/`. The [standalone demo](demo/README.md) supports create, edit, complete/uncomplete, delete, blank-title rejection, and persistence across reload and restart. Everything is synthetic and local; no proprietary applications or data are included.
 
-## Run with live Jev
+### Run your first live check
 
-Set `TYPESAFE_API_KEY` in your environment or copy `.env.example` to the gitignored `.env` in this repository, restrict it with `chmod 600 .env`, and fill in the key. Do not commit credentials or paste them into issue comments.
+In a second terminal, enter the same repository directory. `uv run` uses this checkout's CLI; the separately installed version uses `jev-qa` directly.
 
 Review `examples/policy.json` first: it explicitly permits synthetic demo content to reach TypeSafe, local request/response evidence, read access to the demo origin, and mutations only under `/api/todos`. Screenshots remain disabled. Policy schema defaults deny disclosure and authorize no origins.
 
@@ -71,6 +163,24 @@ uv run jev-qa validate --scenario examples/create.json --policy examples/policy.
 uv run jev-qa run --scenario examples/create.json --policy examples/policy.json \
   --headed --report artifacts/create-report.json
 ```
+
+The browser opens, creates a unique synthetic record, verifies it, and cleans it up. Inspect `artifacts/create-report.json`: expect `verdict: "pass"` on the healthy demo. The terminal summary includes actions, assertions, Jev calls, tokens, and estimated cost. Run identity and model choices can change between executions, so exact counts are not fixed.
+
+Use `examples/lifecycle.json` for the full create/edit/toggle/delete journey, or `examples/validation.json` for rejected-input checks. Stop the demo server with Ctrl-C when finished.
+
+### Command reference
+
+| Command | Purpose |
+| --- | --- |
+| `jev-qa init --project .` | Create project layout and a deny-default policy without overwriting existing configuration |
+| `jev-qa skill install --agent claude --project .` | Install the bundled skill; use `codex` for the other host |
+| `jev-qa schema scenario` / `jev-qa schema policy` | Print the installed JSON schemas |
+| `jev-qa new-scenario ... --from contract.json` | Validate and register a complete caller-authored contract |
+| `jev-qa validate --scenario ... --policy ...` | Check configuration without running Chrome or Jev |
+| `jev-qa run --scenario ... --policy ...` | Execute the scenario and produce a report |
+| `jev-qa run --help` | Show browser, model, screenshot, and attachment options |
+
+Validation is a configuration check, not a passing test of the application.
 
 Chrome opens visibly by default; use `--headless` for hidden real Chrome, or `--headed` to explicitly select visible mode. The old `JEV_QA_HEADLESS` environment setting no longer changes visibility. Visibility flags apply only to isolated launches; an attached browser retains its existing mode. Default execution creates a new private QA profile and an owned tab; it never copies personal cookies. Owned tabs use a reproducible 1280×900 CSS viewport. `--chrome-executable` overrides browser discovery. The model is pinned to `jev-1.13.0`; `--model` changes the TypeSafe model ID. The selected-branch confidence threshold defaults to `0.55`, configurable with `--confidence-threshold`. Live acceptance used that unchanged default; it is not a calibration guarantee for arbitrary sites or models.
 
@@ -107,7 +217,7 @@ Reports use lowercase values and include per-assertion results, redacted local n
 | `blocked` | 2 | Missing permission/credential, uncertainty, unsupported interaction, limit, or incomplete evidence |
 | `error` | 3 | Model/runner/configuration or resource-release failure |
 
-Consumers must inspect `verdict`, not exit 0 alone. JSON is written to stdout and the private local `--report` file. Evidence, profiles, databases, and `.env` are excluded from Git; nothing is automatically uploaded. Native select controls, embedded browsing contexts, and popup workflows are currently unsupported and stop safely.
+Consumers must inspect `verdict`, not exit 0 alone. JSON is written to stdout and the private local `--report` file. Reports, screenshots, profiles, databases, and `.env` stay local and are excluded from this repository's Git tracking; approved page observations are sent to TypeSafe as described above. Native select controls, embedded browsing contexts, and popup workflows are currently unsupported and stop safely.
 
 Scenario `limits` default to 60 actions and 120 seconds. The action count and execution deadline span all steps; model and browser waits use the remaining deadline. Model requests have a cancellable whole-request timeout, so a trickling response cannot renew the budget. Lost/truncated/disconnected capture prevents PASS. An interrupted or ambiguous write is not automatically submitted again; cleanup is skipped when ownership or outcome is uncertain.
 
@@ -119,9 +229,12 @@ follows the policy. `--no-screenshots` disables it even when permitted.
 `model_disclosure` object; denied capture stops preflight rather than silently
 ignoring the request or expanding permissions. Policy defaults remain deny-first.
 
+The supplied demo policy disables screenshots, so do not use it unchanged with capture flags. To try capture, copy it to `artifacts/screenshots-policy.json` (create `artifacts/` if needed), review the copy, and change **only** `model_disclosure.allow_screenshots` to `true`. Leave the origin/method restrictions intact.
+
 ```bash
 # Visible Chrome; explicitly request policy-approved screenshots
-uv run jev-qa run --scenario examples/create.json --policy examples/policy.json --screenshots
+uv run jev-qa run --scenario examples/create.json --policy artifacts/screenshots-policy.json \
+  --screenshot-mode steps --report artifacts/create-with-screenshots.json
 
 # Hidden Chrome; no screenshots, even if policy permits them
 uv run jev-qa run --scenario examples/create.json --policy examples/policy.json --headless --no-screenshots
@@ -181,9 +294,7 @@ provider-reported amount and is null unless every attempt reports `usage.cost_us
 Missing/invalid usage on any attempt leaves the estimate unavailable rather than
 showing a partial bill. Statistics cover this runner's Jev calls, not host-agent usage.
 
-Live verification: the healthy Todo create/cleanup contract produced PASS with
-10 PNGs, 3 Jev calls, and 6,815 tokens; the fake-success contract produced FAIL
-with 6 PNGs, 2 calls, and 4,995 tokens. Neither returned USD cost.
+Real-browser capture-frequency checks on the healthy create/cleanup contract saved 2 images in `steps` mode, 3 in `actions` mode, 1 with `--screenshot-every 3`, and 0 in `failures` mode. The deliberately broken fake-success run saved 1 failure image. These are observed runs, not fixed counts for arbitrary scenarios.
 
 ## Deliberate defects
 

@@ -103,8 +103,24 @@ class EvidenceCollector:
             request_id = params.get("requestId")
             record = self._records.get(request_id)
             if record is not None:
+                if self._is_aborted_next_prefetch(record, params):
+                    # Next.js deliberately cancels speculative route prefetches
+                    # when navigation state changes. They are neither a failed
+                    # application exchange nor evidence for the authored step.
+                    # Do not let one make an otherwise unrelated contract
+                    # uncertifiable; explicit requests remain retained below.
+                    self._remove(request_id)
+                    return
                 record.error = str(params.get("errorText") or "network_loading_failed")
                 self.mark_incomplete(request_id)
+
+    @staticmethod
+    def _is_aborted_next_prefetch(record: EvidenceRecord, params: dict) -> bool:
+        return (
+            record.method == "GET"
+            and str(params.get("errorText") or "") == "net::ERR_ABORTED"
+            and record.request_headers.get("next-router-prefetch") == "1"
+        )
 
     def _request(self, request_id: str | None, request: dict, redirect: dict | None = None) -> None:
         if not request_id:

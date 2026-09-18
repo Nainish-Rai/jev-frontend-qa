@@ -93,6 +93,25 @@ def test_interrupted_pending_mutation_is_retained_as_incomplete():
     assert value.pending_count == 0
 
 
+def test_aborted_next_prefetch_is_not_fatal_but_other_aborted_gets_are():
+    value = collector()
+    params = {"method": "GET", "url": ORIGIN + "/api/todos", "headers": {"next-router-prefetch": "1"}}
+    value.handle_event("Network.requestWillBeSent", {"requestId": "prefetch", "request": params}, "owned-session")
+    value.handle_event(
+        "Network.loadingFailed", {"requestId": "prefetch", "errorText": "net::ERR_ABORTED"}, "owned-session"
+    )
+    assert value.pending_count == 0
+    assert value.drain() == ([], 0)
+
+    request(value, request_id="ordinary-get", method="GET")
+    value.handle_event(
+        "Network.loadingFailed", {"requestId": "ordinary-get", "errorText": "net::ERR_ABORTED"}, "owned-session"
+    )
+    records, _ = value.drain()
+    assert records[0]["incomplete"]
+    assert records[0]["error"] == "net::ERR_ABORTED"
+
+
 def test_capture_exception_and_denial_are_observable_without_disclosing_body():
     value = collector()
     value.mark_incomplete(None)
