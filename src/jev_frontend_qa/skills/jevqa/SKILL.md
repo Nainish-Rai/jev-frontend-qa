@@ -4,9 +4,10 @@ description: >
   Turns a feature's acceptance criteria into authored browser QA contracts and
   executes them with the jev-qa CLI. Use after implementing a user-visible feature,
   when asked to create user journeys or browser-test a change, or when investigating
-  a Jev QA report. Covers UI-only and networked features; identifies unsupported
-  required coverage instead of claiming a partial test verifies the whole feature.
-compatibility: Requires jev-qa, Python 3.12+, and Chrome/Chromium. Browser runs require a privately configured TYPESAFE_API_KEY and an explicitly approved project policy.
+  a Jev QA report. Also supports explicitly requested website exploration with
+  host-planned subgoals. Identifies unsupported required coverage instead of
+  claiming a partial test verifies the whole feature.
+compatibility: Requires jev-qa, Python 3.12+, Chrome/Chromium, and a privately configured TYPESAFE_API_KEY. Browser runs require an approved project policy or explicit goal-only exploration.
 ---
 
 # Jev QA
@@ -28,9 +29,38 @@ browser driver or a free-form request for Jev to decide whether the feature work
    lacks these flags, update it before promising those features.
    `jev-qa init --project .` creates a deny-default policy and scenario directory
    while preserving existing policy.
-3. Read [safe-operation.md](references/safe-operation.md) before execution. Confirm
-   explicit approval for origins, operations, model disclosure, and identity.
-   Installation and a feature request alone do not grant these permissions.
+3. Read [safe-operation.md](references/safe-operation.md) before execution. For
+   policy-based runs, confirm explicit approval for origins, operations, model
+   disclosure, and identity. Installation and a feature request alone do not
+   grant these permissions. Explicit goal-only requests use the branch below.
+
+
+## Exploration branch
+
+For a discovery request without a correctness contract, inspect `jev-qa explore --help`.
+Require explicit `model_disclosure.allow_planner` and `allow_page_text` approval
+plus an installed, authenticated selected host CLI. Run `jev-qa explore --url URL
+--goal GOAL --planner claude|codex --policy POLICY`, with `--fixtures FILE` only for
+caller-supplied exact synthetic values. Retain the approved origin/method limits;
+the CLI does not grant new permissions or switch providers after failure.
+
+If the user explicitly requests exploration without a policy, use `--goal-only`
+instead of `--policy`. No allowlist or fixture file is required: the host planner
+derives text values from the goal and can navigate to new HTTP(S) destinations.
+This mode permits page/action-history disclosure and real account mutations.
+It disables the numeric confidence gate and treats incomplete network capture
+as report diagnostics, not a contract failure. Do not silently choose it to
+bypass a failed policy-based run. Existing-profile use still requires explicit
+`--attach-profile NAME --cdp-url ENDPOINT`; ask the user to sign in themselves
+when required. Observed-target validation and execution deadlines still apply.
+Uncertain browser-input delivery stops without retry. Embedded contexts may
+remain unobserved; this mode does not add unsupported control capabilities.
+
+Read the resulting `exploration` events, coverage limits, and separate
+`session_stats.planner`/`session_stats.jev` accounting. Report COMPLETE as discovery,
+never PASS. A stale pre-input checkpoint may refresh automatically; an ambiguous
+write requires caller direction, not a rerun. Use the contract workflow below
+when acceptance criteria must be verified; exploration is not a substitute.
 
 ## Author the coverage
 

@@ -75,8 +75,11 @@ class EvidenceCollector:
         self._post_data_seen: set[str] = set()
         self._enforcer = PolicyEnforcer(Policy())
 
+    def set_policy(self, policy: Policy) -> None:
+        self._enforcer = PolicyEnforcer(policy)
+
     def set_rules(self, rules: list[dict]) -> None:
-        self._enforcer = PolicyEnforcer(Policy.model_validate({"network": {"allowed_origins": rules}}))
+        self.set_policy(Policy.model_validate({"network": {"allowed_origins": rules}}))
 
     def policy_allows(self, method: str, url: str) -> bool:
         return self._enforcer.check_request(method, url).allowed

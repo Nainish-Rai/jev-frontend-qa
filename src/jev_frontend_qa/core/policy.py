@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
+from pydantic import HttpUrl
+
 from .models import ModelDisclosurePolicy, Policy
 
 
@@ -42,6 +44,11 @@ class PolicyEnforcer:
                 or parts.password is not None
             ):
                 return PolicyDecision(False, "Only authorized HTTP(S) origins without credentials are permitted")
+            if self.policy.goal_only:
+                validated = HttpUrl(url)
+                if validated.username is not None or validated.password is not None:
+                    return PolicyDecision(False, "Only HTTP(S) URLs without credentials are permitted")
+                return PolicyDecision(True)
             host = parts.hostname.encode("idna").decode("ascii").lower()
             if ":" in host:
                 host = f"[{host}]"

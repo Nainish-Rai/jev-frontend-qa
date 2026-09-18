@@ -184,16 +184,7 @@ def create_evidence_daemon():
             if meta == "set_evidence_policy":
                 self._policy = Policy.model_validate(req["policy"])
                 self._deadline = req.get("deadline")
-                self._qa_collector.set_rules(
-                    [
-                        {
-                            "origin": str(rule.origin).rstrip("/"),
-                            "methods": sorted(rule.methods),
-                            "path_prefix": rule.path_prefix,
-                        }
-                        for rule in self._policy.network.allowed_origins
-                    ]
-                )
+                self._qa_collector.set_policy(self._policy)
                 return {"ok": True}
             if meta == "drain_evidence":
                 end = time.monotonic() + min(float(req.get("settle_seconds", 2)), 2)
@@ -603,7 +594,7 @@ class BrowserTransport:
         self._cdp("Input.insertText", text=text)
 
     def dispatch_key(self, key: str, *, modifiers: int = 0) -> None:
-        codes = {"Enter": 13, "Tab": 9, "Escape": 27, "Backspace": 8}
+        codes = {"Enter": 13, "Tab": 9, "Escape": 27, "Backspace": 8, "ArrowUp": 38, "ArrowDown": 40}
         for event in ("keyDown", "keyUp"):
             self._cdp(
                 "Input.dispatchKeyEvent",

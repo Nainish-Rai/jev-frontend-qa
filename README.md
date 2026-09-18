@@ -9,6 +9,8 @@ Evidence-driven frontend QA built on [Jev Ultrafast](https://github.com/browser-
 - **Real browser QA:** visible Chrome by default, optional headless execution, isolated profiles, and explicit policy-approved attachment.
 - **Bounded Jev decisions:** typed operation/target choices over observed controls; exact fixture values and correctness checks remain in code.
 - **Contract and exploratory runs:** check DOM state, correlated HTTP requests/responses, absent requests, and fresh persistence reads; exploration never implies a contract PASS.
+- **Host-planned exploration:** `explore` lets an authenticated Claude or Codex CLI choose bounded subgoals while Jev remains the browser-action selector.
+- **Richer observations:** accessibility names and form/dialog context, unavailable-control explanations, loaded-text pagination/search, keyboard-driven widgets, and nested scrolling.
 - **Portable coding-agent skill:** Claude Code or Codex can author feature-specific scenarios and run the same CLI. No Todo-specific workflow is required.
 - **Configurable screenshots:** all lifecycle states, every action, step outcomes, failures only, or every Nth action; private local PNGs.
 - **Session accounting:** duration, actions, assertions, screenshots, Jev calls/latency/tokens, and estimated cost in the terminal and JSON report.
@@ -16,7 +18,7 @@ Evidence-driven frontend QA built on [Jev Ultrafast](https://github.com/browser-
 
 ## How Jev works in this CLI
 
-**Jev is the action selector, not the test author or the correctness judge.** Claude/Codex (or a human) supplies a scenario and policy. The CLI then runs independently; you do not need a coding agent connected while a scenario executes.
+**Jev is the action selector, not the test author or the correctness judge.** With `run`, Claude/Codex (or a human) supplies a scenario and policy and the CLI executes independently. With `explore`, an explicitly selected, authenticated host CLI plans subgoals during execution; the local runner still authorizes every operation.
 
 ```text
 Human / Claude / Codex
@@ -47,7 +49,7 @@ Deterministic assertions + fresh reads -> verdict + report
 
 1. **Load and authorize.** The CLI validates the scenario/policy, checks credentials and disclosure permissions, and starts a private browser session unless explicitly authorized to attach.
 2. **Observe.** Local snapshot code reads page text and visible controls, including field values, validation/toggle state, and scoped offscreen scroll hints. An authored scope restricts which record/form Jev can act on.
-3. **Ask Jev once per decision.** [`ModelClient`](src/jev_frontend_qa/core/model_client.py) sends one HTTP request to `POST https://api.typesafe.ai/v1/systemone`, using `jev-1.13.0` by default. The request batches an operation question and target questions for available element operations. Supported executable choices are clicks, exact-fixture text entry, scrolling, and waiting, plus `DONE`/`BLOCKED`.
+3. **Ask Jev once per decision.** [`ModelClient`](src/jev_frontend_qa/core/model_client.py) sends one HTTP request to `POST https://api.typesafe.ai/v1/systemone`, using `jev-1.13.0` by default. The request batches an operation question and target questions for available element operations. Executable choices include clicks, exact-fixture text entry, Enter/Escape/ArrowUp/ArrowDown on observed compatible controls, viewport/container scrolling, and waiting, plus `DONE`/`BLOCKED`.
 4. **Accept only a valid offered choice.** The response includes typed choices, probability distributions, and confidence. Code validates the answer against the offered choices and uses the selected operation/target confidence—not confidence for unrelated target questions. The default action threshold is `0.55`; low confidence stops the run as BLOCKED.
 5. **Execute locally.** [`Runner`](src/jev_frontend_qa/core/agent.py) resolves exact input text from scenario fixtures and dispatches through [Browser Harness](src/jev_frontend_qa/core/browser.py). Jev does not generate selectors, JavaScript, field values, or unrestricted tool calls. After input, the runner waits for network evidence to settle before making another decision.
 6. **Verify independently.** Jev's `DONE` means “stop interacting,” not “the test passed.” Authored assertions check the actual DOM and HTTP evidence; persistence assertions perform fresh authorized reads. Conclusive contract evidence can trigger verification without an extra `DONE` call. Only these checks establish a contract verdict.
@@ -60,6 +62,8 @@ Deterministic assertions + fresh reads -> verdict + report
 Jev receives permitted, redacted structured page observations, the current step goal and supplied fixtures, and up to ten recent actions when action-history disclosure is enabled. It receives **text/structured state, not screenshot pixels**. The request does not include captured HTTP request/response bodies; those are local assertion evidence governed by policy and redaction. Do not put real secrets or personal data in test fixtures.
 
 Browser input, assertions, captured evidence, screenshots, and reports stay under local runner control. Screenshots are unredacted and require explicit policy permission. Host-agent usage from Claude/Codex is separate from the Jev usage reported by this CLI.
+
+Planned exploration additionally sends approved, redacted goals, fixtures, page observations, loaded-text reads, and permitted history to the selected host provider. It requires **both** `model_disclosure.allow_page_text` and `model_disclosure.allow_planner`; the latter defaults to false. Host CLIs run in a temporary directory with their tools disabled; Codex also uses its read-only sandbox and ignores project/user configuration. Host authentication and model availability remain external prerequisites. The runner does not silently switch providers.
 
 ## Getting started
 
@@ -125,6 +129,44 @@ jev-qa run --scenario jevqa/scenarios/search/filter.json --policy jevqa/policy.j
 
 **Coverage limits:** current assertions cover DOM values/counts/attributes, captured HTTP exchanges, absence of a request, and authorized fresh GET persistence. Download/file-content validation, uploads, URL-transition assertions, visual grading, native selects, embedded frames, and popup workflows are not supported contracts. The skill reports required unsupported coverage as BLOCKED; a passing supported subset is not a full-feature PASS. Page instructions are untrusted data, and the agent cannot expand project permissions to satisfy them.
 
+### Explore an approved website
+
+Use exploration when you want to discover a workflow, not certify acceptance criteria. Install and authenticate the selected `claude` or `codex` CLI. Keep `TYPESAFE_API_KEY` configured for Jev. Explicitly approve planner disclosure in your existing policy; retain the narrow origin/method restrictions.
+
+```bash
+jev-qa explore --url http://127.0.0.1:3000/ \
+  --goal "Inspect the search workflow and identify what remains unverified" \
+  --planner codex --policy jevqa/policy.json \
+  --max-turns 24 --max-actions 60 --max-seconds 180 \
+  --report artifacts/jevqa/exploration.json
+```
+
+For required text entry, supply `--fixtures fixtures.json`, a JSON object mapping actual field names to exact synthetic strings. The planner cannot invent fixture values, selectors, assertions, or navigation URLs. Navigation is limited to the caller's entry URL and observed policy-authorized links. `--planner claude` is the default; `--planner-model` selects a host model independently of Jev's `--model`.
+
+The planner can observe, read/search loaded rendered text without scrolling, navigate, request an eight-action subgoal, complete, or block. Reads paginate at 6,000 characters and disclose scan limits; hidden text and editable values are excluded. A search miss is not proof of absence, especially with lazy-loaded or embedded content.
+
+Progress memory survives subgoals and ignores node-ID/geometry churn. Repeated no-change waits, empty scrolling, action cycles, or a subgoal limit return safe checkpoints to the planner; a third checkpoint blocks. Only stale observations detected **before input** can refresh, at most twice before a checkpoint. Denied requests, low-confidence choices, and ambiguous writes stop rather than being replanned or resubmitted.
+
+Chrome accessibility metadata supplies names, scope context, popup options, and active options. Disabled, offscreen, or occluded controls are context, never executable targets. Accessibility failures use an explicitly reported DOM-only observation; native selects, shadow-root controls, frames, and popups remain unsupported. Keyboard input revalidates and focuses the observed element; container scrolling uses its freshly hit-tested position.
+
+The report includes `exploration` events and separate `session_stats.planner` accounting. Host cost is null unless reported by the provider; Jev's pricing estimate is never applied to host tokens. `complete` means the exploration ended, **not PASS or exhaustive coverage**. Use an authored contract for correctness and run-owned cleanup.
+
+### Explore from a goal alone
+
+Explicit `--goal-only` replaces `--policy` for unrestricted website exploration:
+
+```bash
+jev-qa explore --goal-only --url https://www.youtube.com/ \
+  --goal "Make a playlist of the top 5 Honey Singh songs" \
+  --planner codex --report artifacts/jevqa/goal-only.json
+```
+
+No policy file, origin/method allowlist, or fixture file is required. The host planner derives text-entry values from the goal and may navigate to new HTTP(S) destinations. Explicit caller fixtures, if supplied, cannot be overwritten. The numeric confidence gate is disabled; incomplete network capture is reported rather than treated as contract failure. This mode can change real account data.
+
+Opting in permits page text and action-history disclosure to Jev and the selected host planner. Request/response bodies are not enabled for model disclosure; screenshots remain opt-in. Existing-profile attachment still requires explicit `--attach-profile NAME --cdp-url ENDPOINT`; otherwise Chrome uses an isolated profile. Sign in yourself when a task requires an authenticated account.
+
+Execution deadlines, observed-target validation, and stopping after uncertain browser-input delivery remain enforced. Embedded content can remain unobserved while the planner operates main-document controls; this does not add frame, popup, shadow-root, or native-select support. Reports identify `metadata.policy_mode` as `goal_only`; COMPLETE is not a contract PASS, proof of persistence, or a guarantee that network effects were fully captured. Authored contracts and policy-based exploration retain their existing checks.
+
 ### Try the synthetic demo from source
 
 Clone the repository and install its dependencies:
@@ -178,6 +220,8 @@ Use `examples/lifecycle.json` for the full create/edit/toggle/delete journey, or
 | `jev-qa new-scenario ... --from contract.json` | Validate and register a complete caller-authored contract |
 | `jev-qa validate --scenario ... --policy ...` | Check configuration without running Chrome or Jev |
 | `jev-qa run --scenario ... --policy ...` | Execute the scenario and produce a report |
+| `jev-qa explore --url ... --goal ... --planner codex --policy ...` | Plan bounded exploration using an authenticated host CLI |
+| `jev-qa explore --goal-only --url ... --goal ... --planner codex` | Explore without a policy file, with planner-generated text values |
 | `jev-qa run --help` | Show browser, model, screenshot, and attachment options |
 
 Validation is a configuration check, not a passing test of the application.
@@ -203,7 +247,7 @@ Run another scenario by changing `--scenario`. Give the model an unambiguous act
 
 Network assertions require an explicit method, exact path, and expected status; optional nested request/response expectations apply to that same exchange. DOM text/count/attribute assertions use authored selectors, never an arbitrary last response. No-request checks require a complete, settled capture window. Persistence reads use an authorized same-origin GET with cache and service-worker bypass. A toast, model DONE, stale response, or fields matched across different records cannot establish PASS.
 
-After a browser action, a contract step can proceed directly to final verification when authored UI/API evidence is conclusive. The runner still performs independent persistence reads; a successful HTTP response alone cannot bypass a pending UI assertion. This avoids asking the model to grade an already-observed result. Every browser input still comes from Jev, every selected low-confidence decision remains BLOCKED, and exploratory completion still requires model DONE. Stopping before any required API interaction was exercised is BLOCKED, not evidence of an application defect.
+After a browser action, a contract step can proceed directly to final verification when authored UI/API evidence is conclusive. The runner still performs independent persistence reads; a successful HTTP response alone cannot bypass a pending UI assertion. This avoids asking the model to grade an already-observed result. Jev selects browser input within subgoals; the exploration planner may additionally select authorized observed-link navigation. Every low-confidence Jev choice remains BLOCKED. Exploratory completion is a model judgment, never a contract verdict. Stopping before any required API interaction was exercised is BLOCKED, not evidence of an application defect.
 
 ### Outcomes
 
@@ -292,7 +336,7 @@ price for a different `--model`.
 `input_tokens` and `output_tokens`, not a USD charge. `cost_usd` remains the separate
 provider-reported amount and is null unless every attempt reports `usage.cost_usd`.
 Missing/invalid usage on any attempt leaves the estimate unavailable rather than
-showing a partial bill. Statistics cover this runner's Jev calls, not host-agent usage.
+showing a partial bill. `session_stats.jev` covers Jev calls; `session_stats.planner` separately covers host invocations in `explore`.
 
 Real-browser capture-frequency checks on the healthy create/cleanup contract saved 2 images in `steps` mode, 3 in `actions` mode, 1 with `--screenshot-every 3`, and 0 in `failures` mode. The deliberately broken fake-success run saved 1 failure image. These are observed runs, not fixed counts for arbitrary scenarios.
 

@@ -1,16 +1,18 @@
 """``jev-qa`` command-line interface.
 
-The CLI exposes three subcommands:
+The CLI exposes QA execution, exploration, validation, and setup commands:
 
 * ``run`` - load a scenario + policy, run the QA loop, write a report, and
   exit with the documented code (0 PASS, 1 FAIL, 2 BLOCKED, 3 ERROR).
+* ``explore`` - pursue a browser goal with a policy, or explicitly select
+  ``--goal-only`` for unrestricted HTTP(S) exploration without a policy file.
 * ``validate`` - check the scenario and policy without launching the
   browser; useful in CI before a model key is available.
 * ``help`` - show the per-subcommand help and exit.
 
 The CLI never installs a fake model mode. The verdict reflects the actual
-provider (or BLOCKED/ERROR when the key is missing). Project policy is
-applied before any browser or model call.
+provider (or BLOCKED/ERROR when the key is missing). Project policy or
+explicit goal-only authorization is applied before browser or model calls.
 """
 
 from __future__ import annotations
@@ -30,7 +32,20 @@ from .core.config import load_config
 from .core.decisions import TypeSafeDecisionProvider
 from .core.evidence import EvidenceCollector
 from .core.model_client import ModelClient, ModelError
-from .core.models import JevUsage, Policy, RedactionPolicy, Report, Scenario, SessionStats, StepResult
+from .core.models import (
+    IdentityPolicy,
+    JevUsage,
+    ModelDisclosurePolicy,
+    Policy,
+    RedactionPolicy,
+    Report,
+    RunLimits,
+    Scenario,
+    SessionStats,
+    Step,
+    StepResult,
+)
+from .core.planner import HostPlanner, PlannerError
 from .core.policy import PolicyEnforcer
 from .core.redaction import fixture_secrets, redact_report
 from .onboarding import add_commands
@@ -55,16 +70,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jev-qa",
         description=(
-            "Evidence-driven frontend QA. The CLI loads a contract scenario "
-            "and a project policy, drives a real browser through Jev and "
-            "Browser Harness, and reports PASS/FAIL/BLOCKED/ERROR."
+            "Evidence-driven frontend QA and browser exploration through Jev "
+            "and Browser Harness. Run authored contracts with a project policy, "
+            "or explore with a policy or explicit --goal-only authorization."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=False)
 
-    run = sub.add_parser("run", help="Run a scenario and write a report.")
-    run.add_argument("--scenario", type=Path, required=True, help="Path to scenario JSON")
-    run.add_argument("--policy", type=Path, required=True, help="Path to project policy JSON")
+    run = argparse.ArgumentParser(add_help=False)
     run.add_argument(
         "--report", type=Path, default=Path("artifacts/report.json"), help="Where to write the JSON report"
     )
@@ -89,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="screenshots",
         action="store_true",
         default=None,
-        help="Save app-state PNGs; requires policy allow_screenshots (default: follow policy)",
+        help="Save app-state PNGs; requires policy permission unless --goal-only (default: follow policy)",
     )
     capture.add_argument(
         "--no-screenshots",
@@ -108,8 +121,10 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="Capture every Nth settled action across the run, including cleanup; implies actions mode",
     )
-    run.add_argument("--attach-profile", default=None, help="Explicit policy-approved synthetic profile name")
-    run.add_argument("--cdp-url", default=None, help="Explicit DevTools endpoint for the approved profile")
+    run.add_argument(
+        "--attach-profile", default=None, help="Explicit profile name; requires policy approval unless --goal-only"
+    )
+    run.add_argument("--cdp-url", default=None, help="Explicit DevTools endpoint; requires --attach-profile")
     run.add_argument("--model", type=str, default=None, help="Override the TypeSafe model id (default jev-1.13.0)")
     run.add_argument(
         "--bu-name", type=str, default=None, help="Prefix for the unique per-run Browser Harness namespace"
@@ -118,8 +133,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--confidence-threshold",
         type=_parse_confidence,
         default=0.55,
-        help="Minimum confidence required to act on a decision (default 0.55)",
+        help="Minimum decision confidence (default 0.55); disabled in --goal-only mode",
     )
+    contract = sub.add_parser("run", parents=[run], help="Run an authored scenario and write a report.")
+    contract.add_argument("--scenario", type=Path, required=True, help="Path to scenario JSON")
+    contract.add_argument("--policy", type=Path, required=True, help="Path to project policy JSON")
+    explore = sub.add_parser(
+        "explore", parents=[run], help="Explore a URL using a policy or explicit --goal-only authorization."
+    )
+    authorization = explore.add_mutually_exclusive_group(required=True)
+    authorization.add_argument("--policy", type=Path, help="Path to project policy JSON")
+    authorization.add_argument(
+        "--goal-only",
+        action="store_true",
+        help=(
+            "Explore without a policy file: allow HTTP(S) origins and methods, page/history/planner disclosure, "
+            "and planner-authored inputs; disable confidence gating. Screenshots remain opt-in."
+        ),
+    )
+    explore.add_argument("--url", required=True, help="Entry URL; must be authorized by policy unless --goal-only")
+    explore.add_argument("--goal", required=True, help="Exploration objective, not a correctness assertion")
+    explore.add_argument("--planner", choices=("claude", "codex"), default="claude")
+    explore.add_argument("--planner-model", help="Optional host planner model override")
+    explore.add_argument("--fixtures", type=Path, help="JSON object of exact caller-owned synthetic field values")
+    explore.add_argument("--max-turns", type=int, default=24)
+    explore.add_argument("--max-actions", type=int, default=60)
+    explore.add_argument("--max-seconds", type=float, default=180.0)
 
     validate = sub.add_parser("validate", help="Validate the scenario and policy JSON without running the browser.")
     validate.add_argument("--scenario", type=Path, required=True)
@@ -148,13 +187,17 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     mode = "attach" if args.attach_profile is not None or args.cdp_url is not None else "isolated"
+    goal_only = getattr(args, "goal_only", False)
     scenario = None
     policy = None
     transport = None
     client = None
+    planner = None
     started = int(time.time() * 1000)
     session_started = time.monotonic()
     try:
+        if goal_only and args.command != "explore":
+            raise PolicyBlocked("Goal-only mode is only available through explore --goal-only")
         config = load_config(
             Path.cwd(),
             cli_overrides={
@@ -164,14 +207,44 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "bu_name": args.bu_name,
             },
         )
-        scenario = load_scenario(args.scenario)
-        policy = load_policy(args.policy)
-        mode = validate_identity(policy, args.attach_profile, args.cdp_url)
-        if mode == "attach" and (args.headless or args.headed):
-            raise PolicyBlocked("Visibility flags cannot change an attached browser; omit them or use isolated mode")
+        if args.command == "explore":
+            fixtures = json.loads(args.fixtures.read_text()) if args.fixtures else {}
+            scenario = Scenario(
+                name="website-exploration",
+                mode="exploratory",
+                start_url=args.url,
+                steps=(Step(id="explore", goal=args.goal, fixtures=fixtures),),
+                limits=RunLimits(max_actions=args.max_actions, max_seconds=args.max_seconds),
+            )
+        else:
+            scenario = load_scenario(args.scenario)
         capture_requested = (
             args.screenshots is True or args.screenshot_mode is not None or args.screenshot_every is not None
         )
+        if goal_only:
+            if mode == "attach" and (not args.attach_profile or not args.cdp_url):
+                raise PolicyBlocked("Attachment requires both --attach-profile and --cdp-url")
+            policy = Policy(
+                goal_only=True,
+                identity=IdentityPolicy(mode=mode, attach_profile_name=args.attach_profile),
+                model_disclosure=ModelDisclosurePolicy(
+                    allow_page_text=True,
+                    allow_action_history=True,
+                    allow_planner=True,
+                    allow_request_bodies=False,
+                    allow_response_bodies=False,
+                    allow_screenshots=capture_requested,
+                ),
+            )
+        else:
+            policy = load_policy(args.policy)
+            if policy.goal_only:
+                raise PolicyBlocked(
+                    "Goal-only mode requires explore --goal-only; it cannot be enabled by a policy file"
+                )
+        mode = validate_identity(policy, args.attach_profile, args.cdp_url)
+        if mode == "attach" and (args.headless or args.headed):
+            raise PolicyBlocked("Visibility flags cannot change an attached browser; omit them or use isolated mode")
         if capture_requested and not policy.model_disclosure.allow_screenshots:
             raise PolicyBlocked("Screenshot options require model_disclosure.allow_screenshots in project policy")
         enforcer = PolicyEnforcer(policy)
@@ -179,6 +252,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             raise PolicyBlocked("Start URL is not permitted by project policy")
         if not enforcer.may_disclose("page_text"):
             raise PolicyBlocked("Project policy does not permit page-content model disclosure")
+        if args.command == "explore":
+            if not policy.model_disclosure.allow_planner:
+                raise PolicyBlocked("Exploration requires model_disclosure.allow_planner for host-model disclosure")
+            planner = HostPlanner(provider=args.planner, model=args.planner_model, goal_only=args.goal_only)
+            planner.ensure_ready()
         api_key = _read_api_key()
         if not api_key:
             raise PolicyBlocked("TYPESAFE_API_KEY is not set; cannot make model calls")
@@ -188,9 +266,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         deadline = time.monotonic() + scenario.limits.max_seconds
         client = ModelClient(api_key=api_key, model=args.model or config.typesafe_model)
         client.deadline = deadline
+        evidence = EvidenceCollector()
+        evidence.set_policy(policy)
         transport = make_transport(
             policy=policy,
-            evidence=EvidenceCollector(),
+            evidence=evidence,
             workdir=config.work_dir.expanduser().resolve(),
             chrome_executable=chrome_path,
             headless=config.chrome_headless,
@@ -206,7 +286,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             provider=provider,
             policy=policy,
             scenario=scenario,
-            confidence_threshold=args.confidence_threshold,
+            confidence_threshold=0.0 if goal_only else args.confidence_threshold,
             screenshot_dir=(
                 args.report.parent / "screenshots" / scenario.run_id
                 if policy.model_disclosure.allow_screenshots and args.screenshots is not False
@@ -214,6 +294,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             ),
             screenshot_mode=args.screenshot_mode or ("actions" if args.screenshot_every is not None else "all"),
             screenshot_every=args.screenshot_every if args.screenshot_every is not None else 1,
+            planner=planner,
+            max_planner_turns=args.max_turns if args.command == "explore" else 24,
         ).run()
         outcome = RunOutcome(
             report=outcome.report.model_copy(update={"execution_mode": mode}), exit_code=outcome.exit_code
@@ -222,7 +304,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         outcome = _early_outcome(scenario, mode, started, "blocked", str(error))
     except TimeoutError:
         outcome = _early_outcome(scenario, mode, started, "blocked", "Scenario deadline exceeded")
-    except ModelError:
+    except (ModelError, PlannerError):
         outcome = _early_outcome(scenario, mode, started, "blocked", "Hosted model is unavailable")
     except (OSError, RuntimeError, ValueError, TypeError, LookupError):
         # Validation/CDP/provider exceptions can contain fixture values, endpoint
@@ -237,6 +319,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         if client is not None:
             with contextlib.suppress(Exception):
                 client.close()
+        if planner is not None:
+            with contextlib.suppress(Exception):
+                planner.close()
     cleanup_notes = getattr(transport, "cleanup_notes", ())
     if cleanup_notes:
         outcome = RunOutcome(
@@ -255,8 +340,17 @@ def cmd_run(args: argparse.Namespace) -> int:
         assertions_failed=sum(not check.passed for step in outcome.report.steps for check in step.assertions),
         screenshots_saved=len(outcome.report.screenshots),
         jev=client.usage_summary() if client is not None else JevUsage(),
+        planner=planner.usage_summary() if planner is not None else {},
     )
-    outcome = RunOutcome(report=outcome.report.model_copy(update={"session_stats": stats}), exit_code=outcome.exit_code)
+    outcome = RunOutcome(
+        report=outcome.report.model_copy(
+            update={
+                "session_stats": stats,
+                "metadata": {**outcome.report.metadata, "policy_mode": "goal_only" if goal_only else "policy"},
+            }
+        ),
+        exit_code=outcome.exit_code,
+    )
     try:
         _emit_outcome(args, outcome, scenario=scenario, policy=policy)
     except OSError:
@@ -387,6 +481,13 @@ def _print_session_summary(payload: dict) -> None:
     )
     if payload["screenshots"]:
         print(f"  Screenshot files: {Path(payload['screenshots'][0]['path']).parent}", file=sys.stderr)
+    if planner := stats.get("planner"):
+        print(
+            f"  Host planner: {planner['invocations']} invocations, {planner['failed_invocations']} failed"
+            f" | input {tokens(planner['input_tokens'])}, output {tokens(planner['output_tokens'])}"
+            " (separate from Jev accounting)",
+            file=sys.stderr,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +502,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_help(args)
     if args.command == "validate":
         return cmd_validate(args)
-    if args.command == "run":
+    if args.command in {"run", "explore"}:
+        if args.command == "explore" and (
+            args.max_turns < 1 or args.max_actions < 1 or not math.isfinite(args.max_seconds) or args.max_seconds <= 0
+        ):
+            parser.error("Exploration turn, action, and time limits must be positive and finite")
         if args.screenshot_every is not None:
             if args.screenshot_every < 1:
                 parser.error("--screenshot-every must be a positive integer")

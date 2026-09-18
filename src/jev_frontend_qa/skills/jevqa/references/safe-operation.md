@@ -8,10 +8,17 @@ Propose the smallest required origins/methods/path prefixes and disclosure chang
 for explicit user approval. Do not relax them merely because a run is blocked.
 Schema validation proves structure, not permission, reachability, or correctness.
 
+Exception: an explicit user request for goal-only exploration uses `explore
+--goal-only` without a policy file. It authorizes page/action-history disclosure
+and removes origin/method, fixture-generation, confidence, and network-completeness
+gates for that exploratory run only. It can mutate real account data and never
+certifies a contract. Attachment still requires explicit profile/endpoint flags.
+Do not choose this mode merely to bypass a failed contract or restricted run.
+
 Default to a local synthetic environment and isolated identity. Personal profiles,
 production data, and destructive operations are outside that default approval.
-A new attachment requires explicit invocation and matching policy authorization;
-identity approval does not imply approval to disclose page content to Jev.
+A new attachment requires explicit invocation and, in policy mode, matching policy
+authorization; identity approval alone does not approve model disclosure.
 The runner owns a new tab, not unrelated tabs or the attached browser process.
 Policy gates are guardrails, not a sandbox against arbitrary backend side effects.
 
@@ -36,9 +43,10 @@ The initializer ignores `/artifacts/jevqa/`; it does not manage your secret file
 Ensure `.env`, credentials, and any separately chosen artifact paths are ignored.
 Do not upload raw evidence. Screenshots are not visual correctness assertions.
 
-For requested screenshots, obtain explicit approval for
-`model_disclosure.allow_screenshots: true` in the selected policy. Once allowed,
-the runner saves viewport PNGs under `<report-directory>/screenshots/<run_id>/`
+For requested screenshots in policy mode, obtain explicit approval for
+`model_disclosure.allow_screenshots: true`. In goal-only mode, screenshot flags
+explicitly opt in; capture is otherwise disabled. Once allowed, the runner saves
+viewport PNGs under `<report-directory>/screenshots/<run_id>/`
 and lists them in `screenshots`. They are unredacted pixels, stored locally and
 never sent to Jev; JSON redaction cannot protect sensitive content inside images.
 Retain capture failures from `findings.missing_evidence` in your summary.
@@ -56,7 +64,7 @@ Translate requested frequency into CLI flags:
 | “Every third action” | `--screenshot-every 3` (implies actions mode) |
 | “No screenshots” | `--no-screenshots` |
 
-Mode/cadence flags explicitly request capture and require policy permission.
+Mode/cadence flags explicitly request capture and require permission in policy mode.
 `actions` captures only after settled actions; `steps` only at step outcomes,
 including cleanup. `failures` captures failed, blocked, or errored step outcomes
 when the browser and deadline permit; preflight failures have no page to capture.

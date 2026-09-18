@@ -14,6 +14,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .accessibility import prepare_accessibility
 from .browser import BrowserTransport
 
 SNAPSHOT_JS_PATH = Path(__file__).with_name("snapshot.js")
@@ -43,6 +44,9 @@ class PageState:
     truncated_text: bool = False
     unsupported: bool = False
     metadata: dict[str, str] = field(default_factory=dict)
+    controls: tuple[dict, ...] = ()
+    links: tuple[dict, ...] = ()
+    diagnostics: dict = field(default_factory=dict)
 
     @property
     def marker(self) -> str:
@@ -52,6 +56,7 @@ class PageState:
 def read_snapshot(transport: BrowserTransport) -> PageState | None:
     """Run the snapshot script in the owned session. Returns None while navigating."""
 
+    diagnostics = prepare_accessibility(transport)
     js = SNAPSHOT_JS_PATH.read_text()
     result = transport.evaluate_js(js)
     if not isinstance(result, dict):
@@ -72,4 +77,7 @@ def read_snapshot(transport: BrowserTransport) -> PageState | None:
         truncated_text=result.get("truncated_text", False),
         unsupported=result.get("unsupported", False),
         metadata=result.get("metadata", {}),
+        controls=tuple(result.get("controls", ())),
+        links=tuple(result.get("links", ())),
+        diagnostics={**diagnostics, **result.get("diagnostics", {})},
     )

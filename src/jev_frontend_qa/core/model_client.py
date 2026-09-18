@@ -38,6 +38,9 @@ Current field values, validation state, toggle state, and recent actions are aut
 TYPE_TEXT only when a required field differs from its exact fixture. Never invent or trim a value.
 SCROLL when a needed control is offscreen. Do not repeat a matching fill or a completed submission.
 Do not reverse a toggle already in the requested state. WAIT only for an unfinished UI transition.
+Keyboard operations focus their observed target automatically; no preliminary click is needed.
+Use ARROW_DOWN/ARROW_UP to open or move through a combobox, PRESS_ENTER to commit its active option,
+and PRESS_ESCAPE to close it. Observe focused, expanded, option_labels and active_option.
 DONE stops interaction, not verification: choose it when the requested state is visible or the
 requested interaction has produced its stopping response, including intentional validation or error.
 After a validation rejection, do not click submit again. Independent code checks correctness.
@@ -47,7 +50,8 @@ TARGET_INSTRUCTIONS = """\
 Choose the best observed target if the next operation is the one specified in this question.
 Use the user's entire goal, field values, nearby text, and recent actions. This question chooses only
 a target for that operation; another question decides which operation to execute. Do not choose
-a field that already contains the requested value. Choose only an offered element index."""
+a field already holding the exact fixture for TYPE_TEXT. Matching text does not rule out Enter,
+Escape, or arrow-key interaction on that field. Choose only an offered element index."""
 
 
 @dataclass
@@ -244,7 +248,19 @@ class ModelClient:
             "model": self.model,
             "state": {
                 "page": {
-                    k: page[k] for k in ("url", "title", "text", "width", "height", "scroll", "scope") if k in page
+                    k: page[k]
+                    for k in (
+                        "url",
+                        "title",
+                        "text",
+                        "width",
+                        "height",
+                        "scroll",
+                        "scope",
+                        "context_controls",
+                        "progress",
+                    )
+                    if k in page
                 },
                 "elements": elements,
                 "recent_actions": [
@@ -334,7 +350,21 @@ def _describe_target(action: Mapping[str, Any]) -> dict:
         "element": f"[{action.get('id', '?')}] {action.get('label', '')}",
         "current_value": action.get("current_value", action.get("value", "")),
     }
-    for key in ("role", "checked", "pressed", "selected", "expanded", "validation", "aria_invalid", "fixture_key"):
+    for key in (
+        "role",
+        "checked",
+        "pressed",
+        "selected",
+        "expanded",
+        "validation",
+        "aria_invalid",
+        "fixture_key",
+        "focused",
+        "context",
+        "option_labels",
+        "active_option",
+        "key",
+    ):
         if key in action:
             description[key] = action[key]
     return description
@@ -349,7 +379,13 @@ def action_space(actions: list[dict]) -> tuple[list[dict], dict[str, dict[str, d
     Returns (elements, targets, controls).
     """
 
-    operations_kind = {"click": "CLICK", "fill": "TYPE_TEXT", "select": "SELECT"}
+    operations_kind = {
+        "click": "CLICK",
+        "fill": "TYPE_TEXT",
+        "select": "SELECT",
+        "key": "KEY",
+        "scroll_element": "SCROLL_ELEMENT",
+    }
     elements: list[dict] = []
     indices: dict[int, str] = {}
     targets: dict[str, dict[str, dict]] = {}
@@ -373,9 +409,13 @@ def action_space(actions: list[dict]) -> tuple[list[dict], dict[str, dict[str, d
                     "pressed",
                     "selected",
                     "expanded",
+                    "focused",
                     "validation",
                     "aria_invalid",
                     "fixture_key",
+                    "context",
+                    "option_labels",
+                    "active_option",
                 )
                 if k in action
             }
@@ -385,7 +425,17 @@ def action_space(actions: list[dict]) -> tuple[list[dict], dict[str, dict[str, d
                 element["options"] = []
             elements.append(element)
         index = indices[node]
-        operation = operations_kind[kind]
+        if kind == "key":
+            operation = {
+                "Enter": "PRESS_ENTER",
+                "Escape": "PRESS_ESCAPE",
+                "ArrowDown": "ARROW_DOWN",
+                "ArrowUp": "ARROW_UP",
+            }[action["key"]]
+        elif kind == "scroll_element":
+            operation = "SCROLL_ELEMENT_DOWN" if action["delta"] > 0 else "SCROLL_ELEMENT_UP"
+        else:
+            operation = operations_kind[kind]
         group = targets.setdefault(operation, {})
         element = elements[int(index) - 1]
         if operation not in element["operations"]:
@@ -408,6 +458,12 @@ def operation_choices(targets: Mapping[str, Any], controls: Mapping[str, dict]) 
         "SCROLL_DOWN": "Reveal needed controls below the visible viewport.",
         "SCROLL_UP": "Reveal needed controls above the visible viewport.",
         "WAIT": "Wait for an unfinished UI transition, not after validation or a completed response.",
+        "PRESS_ENTER": "Focus the observed control and press Enter to commit its active option, or submit only when the goal requires submission.",
+        "PRESS_ESCAPE": "Focus the observed control and press Escape to dismiss its open popup.",
+        "ARROW_DOWN": "Focus the observed combobox/search field and press ArrowDown to open suggestions or move its active option down. A separate click is unnecessary.",
+        "ARROW_UP": "Focus the observed combobox/search field and press ArrowUp to open suggestions or move its active option up. A separate click is unnecessary.",
+        "SCROLL_ELEMENT_DOWN": "Reveal controls or content lower in an observed scrollable container.",
+        "SCROLL_ELEMENT_UP": "Reveal controls or content higher in an observed scrollable container.",
     }
     operations = {key: labels[key] for key in targets}
     for key, control in controls.items():

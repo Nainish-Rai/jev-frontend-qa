@@ -108,6 +108,7 @@ class ModelDisclosurePolicy(_StrictModel):
     allow_request_bodies: bool = False
     allow_response_bodies: bool = False
     allow_screenshots: bool = False
+    allow_planner: bool = False
 
 
 class IdentityPolicy(_StrictModel):
@@ -137,6 +138,7 @@ class Policy(_StrictModel):
     """A project policy authorises where the runner may connect, what it may
     send to hosted models, and what stays out of stored evidence."""
 
+    goal_only: bool = False
     network: NetworkPolicy = Field(default_factory=NetworkPolicy)
     model_disclosure: ModelDisclosurePolicy = Field(default_factory=ModelDisclosurePolicy)
     identity: IdentityPolicy = Field(default_factory=IdentityPolicy)
@@ -397,6 +399,18 @@ class ScreenshotRecord(_StrictModel):
     path: str
 
 
+class ExplorationEvent(_StrictModel):
+    """A planner proposal and the runner-observed result, never an assertion."""
+
+    turn: int
+    operation: str
+    goal: str = ""
+    reason: str = ""
+    url: str = ""
+    status: str
+    observation: dict[str, Any] = Field(default_factory=dict)
+
+
 # User-supplied Jev pricing, used for estimates rather than provider invoices.
 JEV_INPUT_USD_PER_MILLION = 0.042
 JEV_OUTPUT_USD_PER_MILLION = 0.0
@@ -428,6 +442,8 @@ class SessionStats(_StrictModel):
     assertions_failed: int = 0
     screenshots_saved: int = 0
     jev: JevUsage = Field(default_factory=JevUsage)
+    # Host CLI invocations are separate from Jev HTTP attempts and pricing.
+    planner: dict[str, Any] = Field(default_factory=dict)
 
 
 class Report(_StrictModel):
@@ -455,3 +471,4 @@ class Report(_StrictModel):
     # including early-exit paths, so consumers always see a consistent
     # shape even when no scenario steps were recorded.
     session_stats: SessionStats = Field(default_factory=SessionStats)
+    exploration: tuple[ExplorationEvent, ...] = ()

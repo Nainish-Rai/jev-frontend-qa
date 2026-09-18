@@ -1,7 +1,7 @@
 """Bounded, evidence-driven Browser Harness execution.
 
-Adapted from jev-ultrafast (MIT; see THIRD_PARTY_NOTICES.md). The model
-selects observed controls, never fixtures, permissions, or correctness.
+Adapted from jev-ultrafast (MIT; see THIRD_PARTY_NOTICES.md). Jev selects
+observed controls; explicit goal-only exploration also permits planner-supplied text.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from .models import (
     ActionRecord,
     Assertion,
     AssertionResult,
+    ExplorationEvent,
     Policy,
     Report,
     Scenario,
@@ -32,7 +33,9 @@ from .models import (
     Step,
     StepResult,
 )
+from .planner import HostPlanner, PlannerError
 from .policy import PolicyEnforcer
+from .progress import ProgressMemory, semantic_state
 from .redaction import fixture_secrets, redact_report
 from .snapshot import PageState, read_snapshot
 
@@ -42,6 +45,10 @@ MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 class RunBlocked(Exception):
     """The next action cannot be performed safely."""
+
+
+class StaleObservation(RunBlocked):
+    """The observation changed before any input was dispatched."""
 
 
 @dataclass
@@ -75,6 +82,8 @@ class Runner:
     screenshot_dir: Path | None = None
     screenshot_mode: str = "all"
     screenshot_every: int = 1
+    planner: HostPlanner | None = None
+    max_planner_turns: int = 24
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.confidence_threshold) or not 0 <= self.confidence_threshold <= 1:
@@ -85,6 +94,12 @@ class Runner:
             raise ValueError("Screenshot interval must be a positive integer")
         if self.screenshot_every != 1 and self.screenshot_mode != "actions":
             raise ValueError("Screenshot intervals require actions mode")
+        if type(self.max_planner_turns) is not int or self.max_planner_turns < 1:
+            raise ValueError("Planner turn limit must be a positive integer")
+        if self.planner is not None and self.scenario.mode != "exploratory":
+            raise ValueError("Planning cannot replace caller-authored contract expectations")
+        if self.policy.goal_only and (self.scenario.mode != "exploratory" or self.planner is None):
+            raise ValueError("Goal-only execution requires planned exploration, never a contract")
 
     def run(self) -> RunOutcome:
         self.started_at_ms = int(time.time() * 1000)
@@ -97,9 +112,12 @@ class Runner:
         self._metadata: dict[str, str] = {
             "screenshot_mode": self.screenshot_mode if self.screenshot_dir is not None else "disabled",
             "screenshot_every": str(self.screenshot_every),
+            "policy_mode": "goal_only" if self.policy.goal_only else "policy",
         }
         self._screenshots: list[ScreenshotRecord] = []
         self._capture_attempts = 0
+        self._exploration_events: list[ExplorationEvent] = []
+        self._progress = ProgressMemory()
         self._secrets = {
             value
             for step in (*self.scenario.steps, *self.scenario.cleanup)
@@ -131,13 +149,16 @@ class Runner:
             self.transport.navigate(str(self.scenario.start_url))
             self._remaining()
             self._capture_state("initial")
-            for step in self.scenario.steps:
-                active = self._begin_step(step)
-                result = self._drive_step(active)
-                results.append(result)
-                if result.status not in {"pass", "complete"}:
-                    verdict, note = result.status, result.note
-                    break
+            if self.planner is not None:
+                verdict, note = self._drive_exploration(results)
+            else:
+                for step in self.scenario.steps:
+                    active = self._begin_step(step)
+                    result = self._drive_step(active)
+                    results.append(result)
+                    if result.status not in {"pass", "complete"}:
+                        verdict, note = result.status, result.note
+                        break
         except (RunBlocked, ModelError, OSError, RuntimeError, ValueError, TypeError, LookupError) as error:
             verdict = self._error_status(error)
             note = self._safe_error_message(error)
@@ -197,9 +218,181 @@ class Runner:
             metadata=self._metadata,
             findings={key: tuple(values) for key, values in self._findings.items()},
             screenshots=tuple(self._screenshots),
+            exploration=tuple(self._exploration_events),
         )
         report = Report.model_validate(self._redact(report.model_dump()))
         return RunOutcome(report, _exit_code(verdict))
+
+    def _planner_observation(self, page: PageState) -> dict:
+        self._require_request("GET", page.url)
+        if page.unsupported and not self.policy.goal_only:
+            raise RunBlocked("Embedded browsing contexts are unsupported")
+        links = [
+            link for link in getattr(page, "links", ()) if self._enforcer.check_request("GET", link["url"]).allowed
+        ]
+        return {
+            "url": page.url,
+            "title": page.title,
+            "text": page.text,
+            "controls": [
+                {key: value for key, value in control.items() if key not in {"rect", "node", "accessibility"}}
+                for control in (page.controls or page.actions)
+            ],
+            "links": links,
+            "diagnostics": {**page.diagnostics, "embedded_contexts_unobserved": page.unsupported},
+            "milestones": [
+                {
+                    "goal": event.goal,
+                    "url": event.observation.get("page", {}).get("url", event.url),
+                    "observed_text": event.observation.get("page", {}).get("text", "")[:500],
+                }
+                for event in self._exploration_events
+                if event.operation == "act" and event.status == "complete"
+            ]
+            if self.policy.model_disclosure.allow_action_history
+            else [],
+            "limits": {
+                "text_truncated": page.truncated_text,
+                "omitted_actions": page.omitted_actions,
+                "remaining_actions": self.scenario.limits.max_actions - self._actions_taken_total,
+                "remaining_seconds": round(self._remaining(), 2),
+            },
+        }
+
+    def _drive_exploration(self, results: list[StepResult]) -> tuple[str, str | None]:
+        if not self.policy.model_disclosure.allow_planner:
+            raise RunBlocked("Policy does not permit host-planner disclosure")
+        base = self._begin_step(self.scenario.steps[0])
+        known_urls = {str(self.scenario.start_url)}
+        history: list[dict] = []
+        reading: dict | None = None
+        for turn in range(1, self.max_planner_turns + 1):
+            self._remaining()
+            ctx = self._begin_step(Step(id=f"explore.{turn}", goal=base.goal, fixtures=base.fixtures))
+            self._drain_evidence_into_records(ctx)
+            self._require_complete_evidence(ctx)
+            page = self._snapshot_with_retry()
+            observation = self._planner_observation(page)
+            known_urls.update(link["url"] for link in observation["links"])
+            if reading is not None and reading.get("url") == page.url:
+                observation["reading"] = reading
+            decision = self.planner.choose(
+                goal=self._redact(base.goal),
+                observation=self._redact(observation),
+                history=self._redact(history[-8:]) if self.policy.model_disclosure.allow_action_history else [],
+                fixtures=self._redact(base.fixtures),
+                deadline=self._scenario_deadline,
+            )
+            self._remaining()
+            operation = decision.operation
+            status = "complete"
+            result_observation: dict = {}
+            if operation == "act":
+                evidence = ctx.evidence_records
+                supplied = {item.field: item.value for item in decision.inputs}
+                if supplied and not self.policy.goal_only:
+                    raise RunBlocked("Planner-authored text requires explicit goal-only execution")
+                if any(key in base.fixtures and base.fixtures[key] != value for key, value in supplied.items()):
+                    raise RunBlocked("Planner cannot replace an explicit caller fixture")
+                ctx = self._begin_step(
+                    Step(
+                        id=f"explore.{turn}",
+                        goal=decision.goal,
+                        fixtures={**supplied, **base.fixtures},
+                    )
+                )
+                ctx.evidence_records = evidence
+                result = self._drive_step(ctx)
+                results.append(result)
+                status = result.status
+                result_observation = {
+                    "status": status,
+                    "note": result.note,
+                    "actions": [{"operation": action.operation, "label": action.label} for action in result.actions],
+                }
+                if status == "complete":
+                    result_observation["page"] = self._planner_observation(self._snapshot_with_retry())
+                    if result.note and result.note.startswith("Checkpoint:"):
+                        status = "checkpoint"
+                reading = None
+            elif operation == "navigate":
+                if decision.url not in known_urls and not self.policy.goal_only:
+                    raise RunBlocked("Planner navigation URL was not observed or caller-supplied")
+                self._require_request("GET", decision.url)
+                if self._actions_taken_total >= self.scenario.limits.max_actions:
+                    raise RunBlocked("Scenario exceeded max_actions budget")
+                self._actions_taken_total += 1
+                ctx.actions.append(
+                    ActionRecord(
+                        step=ctx.step.id,
+                        action_id="navigate",
+                        label="Navigate to observed URL",
+                        kind="navigate",
+                        operation="NAVIGATE",
+                        page_url=page.url,
+                        executed_at_ms=int(time.time() * 1000),
+                        latency_ms=0,
+                    )
+                )
+                try:
+                    self.transport.navigate(decision.url)
+                except Exception as error:
+                    self._unsafe_evidence = True
+                    raise RunBlocked(
+                        "Navigation interrupted; outcome unknown and no retry permitted: "
+                        + self._safe_error_message(error)
+                    ) from error
+                self._drain_evidence_into_records(ctx)
+                self._require_complete_evidence(ctx)
+                self._settled_actions_total += 1
+                result_observation = self._planner_observation(self._snapshot_with_retry())
+                self._capture_state("after_action", ctx)
+                results.append(self._result(ctx, "complete", None))
+                reading = None
+            elif operation == "read":
+                from .page_reader import read_page
+
+                reading = read_page(self.transport, query=decision.query, offset=decision.offset)
+                self._require_request("GET", reading["url"])
+                reading["links"] = [
+                    link
+                    for link in reading.get("links", ())
+                    if self._enforcer.check_request("GET", link["url"]).allowed
+                ]
+                known_urls.update(link["url"] for link in reading["links"])
+                result_observation = reading
+                if reading.get("scan_limited"):
+                    self._findings["missing_evidence"].append(
+                        "Page reading reached its scan limit; absence is unverified"
+                    )
+                self._drain_evidence_into_records(ctx)
+                self._require_complete_evidence(ctx)
+                results.append(self._result(ctx, "complete", None))
+            elif operation == "observe":
+                result_observation = observation
+                self._record_observation(ctx, page)
+                results.append(self._result(ctx, "complete", None))
+            elif operation in {"complete", "blocked"}:
+                status = "complete" if operation == "complete" else "blocked"
+                self._record_observation(ctx, page)
+                results.append(self._result(ctx, status, decision.reason or None))
+            event = ExplorationEvent(
+                turn=turn,
+                operation=operation,
+                goal=decision.goal,
+                reason=decision.reason,
+                url=page.url,
+                status=status,
+                observation=result_observation,
+            )
+            self._exploration_events.append(event)
+            history.append(event.model_dump())
+            self._findings["model_judgments"].append(
+                f"Planner turn {turn}: {operation}: {decision.reason}; not a correctness verdict"
+            )
+            if operation in {"complete", "blocked"} or status not in {"pass", "complete", "checkpoint"}:
+                return status, result_observation.get("note") or decision.reason or None
+        return "blocked", "Exploration exceeded max_planner_turns budget"
 
     def _begin_step(self, step: Step) -> _StepContext:
         variables = dict(self._variables)
@@ -229,6 +422,7 @@ class Runner:
         history: list[dict[str, Any]] = []
         stagnant = 0
         previous_fingerprint: str | None = None
+        stale_attempts = 0
         try:
             while True:
                 self._remaining()
@@ -239,9 +433,11 @@ class Runner:
                 self._require_request("GET", page.url)
                 if "demoVariant" in page.metadata:
                     self._metadata["demo_variant"] = page.metadata["demoVariant"]
-                if page.omitted_actions or page.truncated_text:
+                if (page.omitted_actions and not self.policy.goal_only) or (
+                    page.truncated_text and self.planner is None
+                ):
                     raise RunBlocked("Page observation was truncated; full evidence is unavailable")
-                if page.unsupported:
+                if page.unsupported and not self.policy.goal_only:
                     raise RunBlocked("Embedded browsing contexts are unsupported")
                 page, scope_present = self._scoped_page(ctx, page)
                 if not scope_present:
@@ -251,11 +447,18 @@ class Runner:
                 if self.scenario.mode == "contract" and ctx.actions and self._contract_ready(ctx):
                     self._record_observation(ctx, page)
                     return self._evaluate_step(ctx)
+                if self.planner is not None:
+                    if len(ctx.actions) >= 8:
+                        return self._checkpoint(ctx, "Subgoal reached its eight-action limit")
+                    page = replace(
+                        page,
+                        actions=tuple(action for action in page.actions if not self._progress.exhausted(page, action)),
+                    )
                 if previous_fingerprint == page.fingerprint:
                     stagnant += 1
                 else:
                     stagnant = 0
-                if stagnant >= 3:
+                if stagnant >= 3 and self.planner is None:
                     raise RunBlocked("No progress after three observations; no further input was sent")
                 previous_fingerprint = page.fingerprint
                 decision = self._choose(ctx, page, history)
@@ -285,10 +488,23 @@ class Runner:
                     "SCROLL_DOWN": "scroll",
                     "SCROLL_UP": "scroll",
                     "WAIT": "wait",
+                    "PRESS_ENTER": "key",
+                    "PRESS_ESCAPE": "key",
+                    "ARROW_DOWN": "key",
+                    "ARROW_UP": "key",
+                    "SCROLL_ELEMENT_DOWN": "scroll_element",
+                    "SCROLL_ELEMENT_UP": "scroll_element",
                 }
                 if expected_kind.get(decision.operation) != action.get("kind"):
                     raise RunBlocked("Selected target does not match the chosen operation")
-                if action.get("unsupported") or action.get("kind") not in {"click", "fill", "scroll", "wait"}:
+                if action.get("unsupported") or action.get("kind") not in {
+                    "click",
+                    "fill",
+                    "scroll",
+                    "wait",
+                    "key",
+                    "scroll_element",
+                }:
                     raise RunBlocked("Selected interaction is unsupported; no scripted input fallback is permitted")
                 if self._actions_taken_total >= self.scenario.limits.max_actions:
                     raise RunBlocked("Scenario exceeded max_actions budget")
@@ -311,6 +527,19 @@ class Runner:
                 )
                 try:
                     self._dispatch_action(page, action, text, ctx)
+                except StaleObservation:
+                    ctx.actions.pop()
+                    self._actions_taken_total -= 1
+                    self._drain_evidence_into_records(ctx)
+                    self._require_complete_evidence(ctx)
+                    if self.planner is None or any(
+                        record.method in MUTATING_METHODS for record in ctx.evidence_records
+                    ):
+                        raise
+                    stale_attempts += 1
+                    if stale_attempts >= 2:
+                        return self._checkpoint(ctx, "Repeated stale observations; no input was dispatched")
+                    continue
                 except RunBlocked:
                     raise
                 except Exception as error:
@@ -319,6 +548,8 @@ class Runner:
                     )
                     self._unsafe_evidence = True
                     raise RunBlocked(ctx.evidence_problem) from error
+                stale_attempts = 0
+                after = self._settle_action(page) if self.planner is not None else None
                 # Consume and settle this input's requests before asking for another decision.
                 self._drain_evidence_into_records(ctx)
                 self._require_complete_evidence(ctx)
@@ -333,8 +564,34 @@ class Runner:
                         "step": len(ctx.actions),
                     }
                 )
+                if after is not None:
+                    history[-1]["page_changed"] = semantic_state(page) != semantic_state(after)
+                    checkpoint = self._progress.record(page, action, after)
+                    if checkpoint:
+                        return self._checkpoint(ctx, checkpoint)
         except (RunBlocked, ModelError, OSError, RuntimeError, ValueError, TypeError, LookupError) as error:
             return self._finalize_step(ctx, self._error_status(error), self._safe_error_message(error))
+
+    def _checkpoint(self, ctx: _StepContext, note: str) -> StepResult:
+        self._progress.checkpoints += 1
+        if self._progress.checkpoints >= 3:
+            return self._finalize_step(ctx, "blocked", "Safe recovery checkpoint budget exhausted: " + note)
+        return self._finalize_step(ctx, "complete", "Checkpoint: " + note)
+
+    def _settle_action(self, before: PageState) -> PageState:
+        initial = semantic_state(before)
+        until = min(self._scenario_deadline, time.monotonic() + 3.0)
+        previous = None
+        stable = 0
+        while True:
+            self._remaining()
+            page = self._snapshot_with_retry()
+            current = semantic_state(page)
+            stable = stable + 1 if current == previous else 0
+            if (current != initial and stable >= 1) or time.monotonic() >= until:
+                return page
+            previous = current
+            time.sleep(min(0.1, self._remaining()))
 
     def _record_observation(self, ctx: _StepContext, page: PageState) -> None:
         self._findings["observed_facts"].append(f"{ctx.step.id}: observed page {page.url} with title {page.title!r}")
@@ -374,7 +631,8 @@ class Runner:
             client.deadline = self._scenario_deadline
         goal = ctx.goal
         if ctx.fixtures:
-            goal += "\nCaller-supplied exact fixtures: " + json.dumps(ctx.fixtures, ensure_ascii=False)
+            label = "Text values for this subgoal" if self.policy.goal_only else "Caller-supplied exact fixtures"
+            goal += "\n" + label + ": " + json.dumps(ctx.fixtures, ensure_ascii=False)
         decision = self.provider.choose(
             goal=self._redact(goal),
             page=self._redact(
@@ -387,6 +645,11 @@ class Runner:
                     "scroll": page.scroll,
                     "scope": ctx.step.scope.model_dump(exclude_none=True) if ctx.step.scope else None,
                     "actions": list(page.actions),
+                    "context_controls": [
+                        {key: value for key, value in control.items() if key not in {"rect", "node", "accessibility"}}
+                        for control in page.controls
+                        if control.get("availability") != "available"
+                    ],
                 }
             ),
             history=self._redact(history) if self.policy.model_disclosure.allow_action_history else [],
@@ -527,7 +790,7 @@ class Runner:
         try:
             records, lost = self.transport.drain_evidence()
             self._evidence_lost_total += lost
-            if lost:
+            if lost and not self.policy.goal_only:
                 ctx.evidence_problem = f"Evidence lost: {lost} entries"
             for entry in records:
                 record = EvidenceRecord.from_drain(entry)
@@ -536,6 +799,11 @@ class Runner:
                     f"{ctx.step.id}: {record.method} {record.url} returned {record.status}"
                 )
                 if record.incomplete or record.error or record.status is None:
+                    if self.policy.goal_only:
+                        self._findings["missing_evidence"].append(
+                            f"Unverified network exchange: {record.method} {record.url}"
+                        )
+                        continue
                     prefix = (
                         "Ambiguous write; never resubmitted"
                         if record.method.upper() in MUTATING_METHODS
@@ -597,14 +865,33 @@ class Runner:
                 for action in page.actions
                 if action.get("node") in allowed_nodes or action.get("kind") in {"wait", "scroll"}
             ),
+            controls=tuple(control for control in page.controls if control.get("node") in allowed_nodes),
         ), True
 
-    def _guarded_point(self, page: PageState, action: dict, ctx: _StepContext, *, focused: bool = False) -> dict:
+    def _guarded_point(
+        self, page: PageState, action: dict, ctx: _StepContext, *, focused: bool = False, before_input: bool = False
+    ) -> dict:
         self._remaining()
         node = action.get("node")
         guard = page.guards.get(str(node))
         if not isinstance(node, int) or guard is None:
             raise RunBlocked("Observed control lacks a stable identity guard")
+        ax = action.get("accessibility")
+        if ax:
+            nodes = self.transport._cdp(
+                "Accessibility.getPartialAXTree",
+                backendNodeId=ax["backend_node_id"],
+                fetchRelatives=False,
+            ).get("nodes", ())
+            current = next((item for item in nodes if item.get("backendDOMNodeId") == ax["backend_node_id"]), None)
+            if (
+                current is None
+                or current.get("ignored")
+                or current.get("role", {}).get("value") != ax["role"]
+                or current.get("name", {}).get("value", "") != ax["name"]
+            ):
+                error = StaleObservation if before_input else RunBlocked
+                raise error("Accessible target identity changed before input")
         scope_check = ""
         if ctx.step.scope is not None:
             scope_check = (
@@ -625,7 +912,8 @@ class Runner:
         )
         point = self.transport.evaluate_js(script)
         if not isinstance(point, dict):
-            raise RunBlocked("Control changed, lost focus, or became occluded before input; no input was retried")
+            error = StaleObservation if before_input else RunBlocked
+            raise error("Control changed, lost focus, or became occluded before input")
         self._remaining()
         return point
 
@@ -637,19 +925,40 @@ class Runner:
         if kind == "scroll":
             current = self.transport.evaluate_js("window.__jevFast?.pageKey()")
             if current != page.page_key:
-                raise RunBlocked("Page changed before scroll")
+                raise StaleObservation("Page changed before scroll")
             self.transport.scroll(page.width / 2, page.height / 2, delta_y=action["delta"])
             return
-        point = self._guarded_point(page, action, ctx)
-        self.transport.dispatch_mouse(point["x"], point["y"])
-        if kind == "fill":
-            self._guarded_point(page, action, ctx, focused=True)
-            self.transport.select_all()
-            self._guarded_point(page, action, ctx, focused=True)
-            if text:
-                self.transport.insert_text(text)
+        point = self._guarded_point(page, action, ctx, before_input=True)
+        try:
+            if kind == "scroll_element":
+                current = self.transport.evaluate_js(f"window.__jevFast.nodes.get({action['node']})?.scrollTop")
+                if current != action["scroll_y"]:
+                    raise StaleObservation("Container position changed before scroll")
+                self.transport.scroll(point["x"], point["y"], delta_y=action["delta"])
+            elif kind == "key":
+                if action["key"] not in {"Enter", "Escape", "ArrowDown", "ArrowUp"}:
+                    raise RunBlocked("Unobserved keyboard operation")
+                self.transport.evaluate_js(
+                    f"window.__jevFast.nodes.get({action['node']}).focus({{preventScroll:true}})"
+                )
+                self._guarded_point(page, action, ctx, focused=True)
+                self.transport.dispatch_key(action["key"])
             else:
-                self.transport.dispatch_key("Backspace")
+                self.transport.dispatch_mouse(point["x"], point["y"])
+                if kind == "fill":
+                    self._guarded_point(page, action, ctx, focused=True)
+                    self.transport.select_all()
+                    self._guarded_point(page, action, ctx, focused=True)
+                    if text:
+                        self.transport.insert_text(text)
+                    else:
+                        self.transport.dispatch_key("Backspace")
+        except StaleObservation:
+            raise
+        except RunBlocked as error:
+            self._unsafe_evidence = True
+            ctx.evidence_problem = "Input interrupted; outcome unknown and never resubmitted"
+            raise RunBlocked(ctx.evidence_problem) from error
         self._remaining()
 
     def _resolve_text(self, action: dict, fixtures: Mapping[str, str]) -> str | None:
@@ -661,6 +970,13 @@ class Runner:
         label = action.get("label")
         if label in fixtures:
             return fixtures[label]
+        if self.policy.goal_only:
+            for field in (key, label):
+                normalized = re.sub(r"[^A-Za-z0-9_]+", "_", field or "").strip("_").lower()
+                if normalized and normalized[0].isdigit():
+                    normalized = "field_" + normalized
+                if normalized in fixtures:
+                    return fixtures[normalized]
         raise RunBlocked("No exact caller fixture maps to the selected field")
 
     def _finalize_step(self, ctx: _StepContext, status: str, note: str | None) -> StepResult:
@@ -768,7 +1084,7 @@ class Runner:
             raise RunBlocked("Policy does not permit page text, labels, or field values to be disclosed to the model")
 
     def _error_status(self, error: Exception) -> str:
-        if isinstance(error, (RunBlocked, ValueError, PermissionError, TimeoutError, ConnectionError)):
+        if isinstance(error, (RunBlocked, PlannerError, ValueError, PermissionError, TimeoutError, ConnectionError)):
             return "blocked"
         if isinstance(error, ModelError):
             return "blocked" if error.code in {"missing_key", "invalid_choice", "timeout"} else "error"
