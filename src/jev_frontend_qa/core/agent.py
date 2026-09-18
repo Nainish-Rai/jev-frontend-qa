@@ -12,6 +12,7 @@ import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -20,7 +21,17 @@ from .browser import BrowserTransport
 from .decisions import DecisionProvider, model_name_from_provider, provider_label
 from .evidence import EvidenceRecord
 from .model_client import ModelError
-from .models import ActionRecord, Assertion, AssertionResult, Policy, Report, Scenario, Step, StepResult
+from .models import (
+    ActionRecord,
+    Assertion,
+    AssertionResult,
+    Policy,
+    Report,
+    Scenario,
+    ScreenshotRecord,
+    Step,
+    StepResult,
+)
 from .policy import PolicyEnforcer
 from .redaction import fixture_secrets, redact_report
 from .snapshot import PageState, read_snapshot
@@ -61,19 +72,34 @@ class Runner:
     scenario: Scenario
     confidence_threshold: float = 0.55
     started_at_ms: int = 0
+    screenshot_dir: Path | None = None
+    screenshot_mode: str = "all"
+    screenshot_every: int = 1
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.confidence_threshold) or not 0 <= self.confidence_threshold <= 1:
             raise ValueError("Confidence threshold must be finite and between 0 and 1")
+        if self.screenshot_mode not in {"all", "actions", "steps", "failures"}:
+            raise ValueError("Unknown screenshot mode")
+        if type(self.screenshot_every) is not int or self.screenshot_every < 1:
+            raise ValueError("Screenshot interval must be a positive integer")
+        if self.screenshot_every != 1 and self.screenshot_mode != "actions":
+            raise ValueError("Screenshot intervals require actions mode")
 
     def run(self) -> RunOutcome:
         self.started_at_ms = int(time.time() * 1000)
         self._actions_taken_total = 0
+        self._settled_actions_total = 0
         self._evidence_lost_total = 0
         self._unsafe_evidence = False
         self._variables = {"run_id": self.scenario.run_id}
         self._owned_captures: set[str] = set()
-        self._metadata: dict[str, str] = {}
+        self._metadata: dict[str, str] = {
+            "screenshot_mode": self.screenshot_mode if self.screenshot_dir is not None else "disabled",
+            "screenshot_every": str(self.screenshot_every),
+        }
+        self._screenshots: list[ScreenshotRecord] = []
+        self._capture_attempts = 0
         self._secrets = {
             value
             for step in (*self.scenario.steps, *self.scenario.cleanup)
@@ -104,6 +130,7 @@ class Runner:
             self._remaining()
             self.transport.navigate(str(self.scenario.start_url))
             self._remaining()
+            self._capture_state("initial")
             for step in self.scenario.steps:
                 active = self._begin_step(step)
                 result = self._drive_step(active)
@@ -169,6 +196,7 @@ class Runner:
             cleanup_notes=tuple(cleanup_notes),
             metadata=self._metadata,
             findings={key: tuple(values) for key, values in self._findings.items()},
+            screenshots=tuple(self._screenshots),
         )
         report = Report.model_validate(self._redact(report.model_dump()))
         return RunOutcome(report, _exit_code(verdict))
@@ -294,6 +322,8 @@ class Runner:
                 # Consume and settle this input's requests before asking for another decision.
                 self._drain_evidence_into_records(ctx)
                 self._require_complete_evidence(ctx)
+                self._settled_actions_total += 1
+                self._capture_state("after_action", ctx)
                 history.append(
                     {
                         "action": action["label"],
@@ -423,8 +453,10 @@ class Runner:
         fresh_paths = tuple(dict.fromkeys(assertion.path for assertion in persistence))
         if ctx.step.reload_after or fresh_paths:
             previous_evidence_count = len(ctx.evidence_records)
+            self._capture_state("before_reload", ctx)
             try:
                 self._reload_and_collect_fresh(ctx, fresh_paths)
+                self._capture_state("after_reload", ctx)
             except Exception:
                 self._drain_evidence_into_records(ctx)
                 self._require_complete_evidence(ctx)
@@ -657,6 +689,7 @@ class Runner:
         return self._result(ctx, status, note)
 
     def _result(self, ctx: _StepContext, status: str, note: str | None) -> StepResult:
+        self._capture_state(f"step_{status}", ctx)
         return StepResult(
             id=ctx.step.id,
             status=status,
@@ -674,6 +707,49 @@ class Runner:
                 )
                 for outcome in ctx.outcomes
             ),
+        )
+
+    def _capture_state(self, phase: str, ctx: _StepContext | None = None) -> None:
+        if self.screenshot_dir is None or not self.policy.model_disclosure.allow_screenshots:
+            return
+        if self.screenshot_mode == "actions":
+            if phase != "after_action" or self._settled_actions_total % self.screenshot_every:
+                return
+        elif (
+            self.screenshot_mode == "steps"
+            and not phase.startswith("step_")
+            or self.screenshot_mode == "failures"
+            and phase not in {"step_fail", "step_blocked", "step_error"}
+        ):
+            return
+        step_id = ctx.step.id if ctx else None
+        # Avoid a duplicate terminal capture when the last capture for this
+        # step already recorded the settled post-action view; assertion
+        # evaluation never mutates the page, so step_{status} would be a
+        # pixel-for-pixel repeat of after_action.
+        if self.screenshot_mode == "all" and phase.startswith("step_") and self._screenshots:
+            last = self._screenshots[-1]
+            if last.step == step_id and last.phase == "after_action":
+                return
+        self._capture_attempts += 1
+        path = self.screenshot_dir / f"{self._capture_attempts:04d}-{phase}.png"
+        try:
+            self._remaining()
+            self.transport.screenshot(path)
+        except (OSError, RuntimeError, ValueError, TypeError, LookupError, RunBlocked, PermissionError):
+            # Authored safe note; never leak transport/exception text into the report.
+            self._findings["missing_evidence"].append(
+                f"Screenshot unavailable: {phase}; capture was denied, failed, or exceeded the deadline."
+            )
+            return
+        self._screenshots.append(
+            ScreenshotRecord(
+                step=step_id,
+                phase=phase,
+                action_index=len(ctx.actions) if ctx else None,
+                captured_at_ms=int(time.time() * 1000),
+                path=str(path.absolute()),
+            )
         )
 
     def _remaining(self) -> float:

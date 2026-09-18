@@ -36,6 +36,44 @@ The initializer ignores `/artifacts/jevqa/`; it does not manage your secret file
 Ensure `.env`, credentials, and any separately chosen artifact paths are ignored.
 Do not upload raw evidence. Screenshots are not visual correctness assertions.
 
+For requested screenshots, obtain explicit approval for
+`model_disclosure.allow_screenshots: true` in the selected policy. Once allowed,
+the runner saves viewport PNGs under `<report-directory>/screenshots/<run_id>/`
+and lists them in `screenshots`. They are unredacted pixels, stored locally and
+never sent to Jev; JSON redaction cannot protect sensitive content inside images.
+Retain capture failures from `findings.missing_evidence` in your summary.
+Use `--screenshots` to request capture (blocked if policy denies it), or
+`--no-screenshots` to disable it. Without either flag, capture follows policy.
+
+Translate requested frequency into CLI flags:
+
+| User request | Flags |
+| --- | --- |
+| “Capture all app states” | `--screenshot-mode all` (default lifecycle schedule) |
+| “After every action” | `--screenshot-mode actions` |
+| “Only the final state of each step” | `--screenshot-mode steps` |
+| “Failures only” | `--screenshot-mode failures` |
+| “Every third action” | `--screenshot-every 3` (implies actions mode) |
+| “No screenshots” | `--no-screenshots` |
+
+Mode/cadence flags explicitly request capture and require policy permission.
+`actions` captures only after settled actions; `steps` only at step outcomes,
+including cleanup. `failures` captures failed, blocked, or errored step outcomes
+when the browser and deadline permit; preflight failures have no page to capture.
+Cadence counts settled actions across the whole run, including cleanup, starting
+at action N; it does not reset per step. Every N means actions, not seconds.
+Use positive integers and actions mode for `--screenshot-every`. Do not combine
+mode/cadence options with `--no-screenshots`; contradictory settings are rejected.
+Preserve unsupported time-based or custom-trigger requests as coverage limitations.
+
+Read `session_stats` for duration, assertions, actions, screenshot count, and Jev
+request/latency/token/USD counters. Missing or incomplete usage is unavailable,
+not free. The estimate uses the supplied rates of $0.042/million input tokens
+and $0/million output tokens; report `estimated_cost_usd` as an estimate, separate
+from provider-reported `cost_usd`. Preserve nulls and completeness flags. These
+rates are not independently verified for a different model. Host-agent tokens
+and billing are outside this runner's statistics.
+
 ## Result interpretation
 
 | Verdict | Exit | Meaning |

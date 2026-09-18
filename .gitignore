@@ -24,3 +24,9 @@ browser-profiles/
 *.sqlite3-*
 *.log
 .DS_Store
+
+# Local host installations and authored QA scenarios
+/.agents/
+/.claude/
+/jevqa/
+/skills-lock.json

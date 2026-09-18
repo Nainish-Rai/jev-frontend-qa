@@ -42,7 +42,7 @@ jev-qa new-scenario --project . --feature search --journey filter \
   --from /path/to/authored-contract.json
 jev-qa validate --scenario jevqa/scenarios/search/filter.json --policy jevqa/policy.json
 jev-qa run --scenario jevqa/scenarios/search/filter.json --policy jevqa/policy.json \
-  --headless --work-dir artifacts/jevqa/work --report artifacts/jevqa/search-filter.json
+  --work-dir artifacts/jevqa/work --report artifacts/jevqa/search-filter.json
 ```
 
 `new-scenario` validates a complete contract before writing and refuses overwrites; it does not generate guessed endpoints, selectors, fixture values, or empty assertion templates. Omitting `run_id` preserves fresh run identity on each execution.
@@ -72,7 +72,7 @@ uv run jev-qa run --scenario examples/create.json --policy examples/policy.json 
   --headed --report artifacts/create-report.json
 ```
 
-Use `--headless` for a non-visible browser. Default execution creates a new private QA profile and an owned tab; it never copies personal cookies. Owned tabs use a reproducible 1280×900 CSS viewport. `--chrome-executable` overrides browser discovery. The model is pinned to `jev-1.13.0`; `--model` changes the TypeSafe model ID. The selected-branch confidence threshold defaults to `0.55`, configurable with `--confidence-threshold`. Live acceptance used that unchanged default; it is not a calibration guarantee for arbitrary sites or models.
+Chrome opens visibly by default; use `--headless` for hidden real Chrome, or `--headed` to explicitly select visible mode. The old `JEV_QA_HEADLESS` environment setting no longer changes visibility. Visibility flags apply only to isolated launches; an attached browser retains its existing mode. Default execution creates a new private QA profile and an owned tab; it never copies personal cookies. Owned tabs use a reproducible 1280×900 CSS viewport. `--chrome-executable` overrides browser discovery. The model is pinned to `jev-1.13.0`; `--model` changes the TypeSafe model ID. The selected-branch confidence threshold defaults to `0.55`, configurable with `--confidence-threshold`. Live acceptance used that unchanged default; it is not a calibration guarantee for arbitrary sites or models.
 
 The CLI calls `POST https://api.typesafe.ai/v1/systemone`. A missing key or denied permission returns BLOCKED before browser launch. Protocol tests are not a substitute for running this command with valid credentials.
 
@@ -110,6 +110,80 @@ Reports use lowercase values and include per-assertion results, redacted local n
 Consumers must inspect `verdict`, not exit 0 alone. JSON is written to stdout and the private local `--report` file. Evidence, profiles, databases, and `.env` are excluded from Git; nothing is automatically uploaded. Native select controls, embedded browsing contexts, and popup workflows are currently unsupported and stop safely.
 
 Scenario `limits` default to 60 actions and 120 seconds. The action count and execution deadline span all steps; model and browser waits use the remaining deadline. Model requests have a cancellable whole-request timeout, so a trickling response cannot renew the budget. Lost/truncated/disconnected capture prevents PASS. An interrupted or ambiguous write is not automatically submitted again; cleanup is skipped when ownership or outcome is uncertain.
+
+### Screenshots and Jev session statistics
+
+Screenshot flags are `--screenshots` and `--no-screenshots`. With neither, capture
+follows the policy. `--no-screenshots` disables it even when permitted.
+`--screenshots` requires `"allow_screenshots": true` in the policy's existing
+`model_disclosure` object; denied capture stops preflight rather than silently
+ignoring the request or expanding permissions. Policy defaults remain deny-first.
+
+```bash
+# Visible Chrome; explicitly request policy-approved screenshots
+uv run jev-qa run --scenario examples/create.json --policy examples/policy.json --screenshots
+
+# Hidden Chrome; no screenshots, even if policy permits them
+uv run jev-qa run --scenario examples/create.json --policy examples/policy.json --headless --no-screenshots
+```
+
+Customize capture frequency using `--screenshot-mode`:
+
+| Mode | Captured states |
+| --- | --- |
+| `all` (default) | Initial page, post-action states, around reloads, and step outcomes; adjacent redundant terminal captures may be omitted |
+| `actions` | After each settled action only |
+| `steps` | Final state of each step, including cleanup |
+| `failures` | Failed, blocked, or errored step outcomes only |
+
+`--screenshot-every N` captures every Nth settled action across the entire run,
+including cleanup, starting at N. It implies `actions` mode and does not reset at
+step boundaries. N must be positive; time-based capture is not supported.
+Mode/frequency flags request capture and require policy permission. Combining
+them with `--no-screenshots`, or combining a cadence with a non-actions mode, is
+an error. A preflight failure has no page to capture; deadlines still apply.
+
+Examples: append `--screenshot-mode failures` for failure-only evidence, or
+`--screenshot-every 3` for every third action. Claude/Codex can select these flags
+from the prompt using the installed skill. Report metadata records the selected
+mode and interval.
+
+Each run saves private PNG files beside its report at
+`<report-directory>/screenshots/<run_id>/<counter>-<phase>.png`.
+The report's `screenshots` array records the path, phase, step, action
+index, and capture timestamp. Capture obeys the page-origin/capture policy and
+scenario deadline. Failures are listed in `findings.missing_evidence`; they do not
+replace the actual assertion verdict.
+
+Screenshots are **unredacted viewport pixels**, kept locally and never sent to Jev.
+JSON redaction does not mask images. Use synthetic data and review images before
+sharing. Private files use mode 0600; symlinked destinations and overwrites are
+refused. Secure image storage currently requires POSIX directory-descriptor support
+(macOS/Linux); unsupported platforms report capture unavailable. These images are
+human-review evidence, not automated visual correctness assertions.
+
+At completion, the CLI prints a readable summary to **stderr**, preserving JSON-only
+stdout. The same counters are stored in `session_stats`: elapsed session time,
+attempted browser actions, passed/failed assertions, screenshot count, actual Jev
+HTTP attempts and failed calls, cumulative request time, input/output/total tokens,
+and estimated USD cost (plus provider-reported cost when available). Cleanup calls count too; a DONE
+decision still counts as a model call even though it dispatches no browser action.
+
+Cost estimates use the supplied Jev rates: **$0.042 per million input tokens,
+$0 per million output tokens**. `session_stats.jev.estimated_cost_usd` equals
+`input_tokens × 0.042 / 1,000,000`; the pricing basis is stored alongside it.
+This is an estimate, not an invoice, account balance, or independently verified
+price for a different `--model`.
+
+[Jev's documented usage response](https://docs.typesafe.ai/api.md) provides
+`input_tokens` and `output_tokens`, not a USD charge. `cost_usd` remains the separate
+provider-reported amount and is null unless every attempt reports `usage.cost_usd`.
+Missing/invalid usage on any attempt leaves the estimate unavailable rather than
+showing a partial bill. Statistics cover this runner's Jev calls, not host-agent usage.
+
+Live verification: the healthy Todo create/cleanup contract produced PASS with
+10 PNGs, 3 Jev calls, and 6,815 tokens; the fake-success contract produced FAIL
+with 6 PNGs, 2 calls, and 4,995 tokens. Neither returned USD cost.
 
 ## Deliberate defects
 
@@ -164,8 +238,6 @@ Installed-wheel smoke checks exercised initialization, both host installation pa
 
 These are observed acceptance results, not a guarantee that every future model run completes. Uncertainty remains BLOCKED rather than weakening the threshold or substituting scripted decisions. Native select interactions, embedded browsing contexts, and popup workflows are unsupported and fail closed. Raw local reports, profiles, databases, and credentials remain gitignored.
 
-## Development and attribution
+## Attribution
 
-Use Matt Pocock's workflow: approved design → vertical issues → behavioral verification → independent standards/spec review. Start with `CONTEXT.md`, `docs/design.md`, and `docs/adr/`. [GitHub Issues](https://github.com/Nainish-Rai/jev-frontend-qa/issues) retain the acceptance dependencies.
-
-The project-local [TypeSafe skill](.agents/skills/typesafe-ai/SKILL.md) guides the integration. Adapted upstream MIT notices are preserved in [THIRD_PARTY_NOTICES.md](src/jev_frontend_qa/THIRD_PARTY_NOTICES.md). Current protocol references: [HTTP API](https://docs.typesafe.ai/api), [Choice](https://docs.typesafe.ai/primitives/choice), and [models](https://docs.typesafe.ai/models).
+Adapted upstream MIT notices are preserved in [THIRD_PARTY_NOTICES.md](src/jev_frontend_qa/THIRD_PARTY_NOTICES.md). Current protocol references: [HTTP API](https://docs.typesafe.ai/api), [Choice](https://docs.typesafe.ai/primitives/choice), and [models](https://docs.typesafe.ai/models).

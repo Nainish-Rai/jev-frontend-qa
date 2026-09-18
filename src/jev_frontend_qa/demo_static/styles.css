@@ -117,15 +117,6 @@ body {
   padding: var(--space-7) var(--space-5) var(--space-6);
 }
 
-.masthead__eyebrow {
-  margin: 0 0 var(--space-3);
-  font-family: var(--mono);
-  font-size: 0.78rem;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--ink-mute);
-}
-
 .masthead__title {
   margin: 0;
   font-family: var(--serif);
@@ -134,22 +125,6 @@ body {
   line-height: 1.05;
   letter-spacing: -0.02em;
   font-style: italic;
-}
-
-.masthead__lede {
-  margin: var(--space-5) 0 0;
-  max-width: var(--measure);
-  font-size: 1.05rem;
-  color: var(--ink-soft);
-}
-
-.inline-mono {
-  font-family: var(--mono);
-  font-size: 0.92em;
-  background: var(--rule-soft);
-  padding: 0.1em 0.35em;
-  border-radius: var(--radius-sm);
-  color: var(--ink);
 }
 
 .layout {

@@ -21,9 +21,13 @@ browser driver or a free-form request for Jev to decide whether the feature work
    and existing `jevqa/` contracts. Read implementation only to locate integration
    details (selectors, field names, routes); expected behavior comes from the
    requirement. Resolve materially missing expectations with the user.
-2. Check `jev-qa --help`. If unavailable, follow the package installation instructions
-   rather than inventing commands. `jev-qa init --project .` creates a deny-default
-   policy and scenario directory while preserving existing policy.
+2. Check `jev-qa run --help` for `--headless`, `--screenshots`, `--no-screenshots`,
+   `--screenshot-mode`, and `--screenshot-every`. In a `jev-frontend-qa` source checkout, use `uv run jev-qa`
+   if the executable is not on PATH; apply that prefix consistently below.
+   Otherwise follow the package installation instructions. If the installed CLI
+   lacks these flags, update it before promising those features.
+   `jev-qa init --project .` creates a deny-default policy and scenario directory
+   while preserving existing policy.
 3. Read [safe-operation.md](references/safe-operation.md) before execution. Confirm
    explicit approval for origins, operations, model disclosure, and identity.
    Installation and a feature request alone do not grant these permissions.
@@ -55,15 +59,31 @@ browser driver or a free-form request for Jev to decide whether the feature work
    supervised process mechanism; retain ownership of processes you start. Then run:
 
    ```bash
-   jev-qa run --scenario jevqa/scenarios/FEATURE/JOURNEY.json --policy jevqa/policy.json --headless --work-dir artifacts/jevqa/work --report artifacts/jevqa/FEATURE-JOURNEY.json
+   jev-qa run --scenario jevqa/scenarios/FEATURE/JOURNEY.json --policy jevqa/policy.json --work-dir artifacts/jevqa/work --report artifacts/jevqa/FEATURE-JOURNEY.json
    ```
 
-   Use `--headed` for a requested demonstration. Keep the key out of arguments and
-   prompts. Stop only processes you started when finished.
+   Chrome opens visibly by default; add `--headless` only for a requested hidden
+   run. Use `--screenshots` for policy-approved capture or `--no-screenshots` to
+   disable it. Keep the key out of arguments and prompts. Stop only processes
+   you started when finished.
+   Translate capture-frequency requests using the prompt-to-flags table in
+   [safe operation](references/safe-operation.md); include the chosen mode and
+   cadence in your summary. A prompt alone does not configure runner capture.
 8. Read the JSON verdict, assertions, evidence, findings, and cleanup notes. Report
    executed coverage separately from unexecuted or unsupported requirements, with
    report paths and concrete failures/blockers. Exit 0 alone does not mean PASS:
    exploratory `complete` certifies no contract.
+   Finish with this report, populated from the actual JSON:
+   - Verdict, executed coverage, and any untested/unsupported requirements.
+   - Duration, attempted actions, and passed/failed assertion counts.
+   - Screenshot count and saved paths, or why capture was disabled/unavailable.
+   - Jev request count, failed requests, and cumulative request time.
+   - Input/output/total tokens and whether accounting is complete.
+   - Estimated USD cost and its input/output rates, separate from provider-reported
+     cost. Preserve unavailable values; an estimate is not an invoice.
+   - JSON report path, concrete failures/blockers, and cleanup outcome.
+   Host-agent usage is separate. For screenshot requests and pricing interpretation,
+   follow [safe operation](references/safe-operation.md).
 9. Required downloads/file contents, uploads, URL transitions, visual grading,
    native selects, frames, or popups are currently unsupported. Report these as
    BLOCKED in your coverage summary. Do not fabricate runner JSON, lower the

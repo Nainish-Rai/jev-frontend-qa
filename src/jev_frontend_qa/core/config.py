@@ -50,7 +50,7 @@ def load_config(repo_root: Path, *, cli_overrides: Mapping[str, object] | None =
     return LoadedConfig(
         typesafe_model=os.environ.get("TYPESAFE_MODEL", "jev-1.13.0"),
         chrome_executable=_override(overrides, "chrome_executable", os.environ.get("JEV_QA_CHROME_EXECUTABLE")),
-        chrome_headless=bool(_override(overrides, "headless", _env_bool("JEV_QA_HEADLESS", default=False))),
+        chrome_headless=bool(_override(overrides, "headless", False)),
         work_dir=Path(str(_override(overrides, "work_dir", os.environ.get("JEV_QA_WORK_DIR", "artifacts/work")))),
         bu_name=_override(overrides, "bu_name", None),
     )
@@ -59,10 +59,3 @@ def load_config(repo_root: Path, *, cli_overrides: Mapping[str, object] | None =
 def _override(overrides: Mapping[str, object], key: str, default: object) -> object:
     value = overrides.get(key)
     return default if value is None else value
-
-
-def _env_bool(name: str, *, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}

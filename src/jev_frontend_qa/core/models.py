@@ -384,6 +384,52 @@ class StepResult(_StrictModel):
     note: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# Session telemetry
+# ---------------------------------------------------------------------------
+class ScreenshotRecord(_StrictModel):
+    """Local PNG evidence; pixels are not redacted or uploaded."""
+
+    step: str | None = None
+    phase: str
+    action_index: int | None = None
+    captured_at_ms: int
+    path: str
+
+
+# User-supplied Jev pricing, used for estimates rather than provider invoices.
+JEV_INPUT_USD_PER_MILLION = 0.042
+JEV_OUTPUT_USD_PER_MILLION = 0.0
+
+
+class JevUsage(_StrictModel):
+    """Actual HTTP attempts; totals are unknown if any attempt lacks valid usage."""
+
+    requests: int = 0
+    failed_requests: int = 0
+    latency_ms: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    cost_usd: float | None = None
+    estimated_cost_usd: float | None = None
+    input_usd_per_million: float = JEV_INPUT_USD_PER_MILLION
+    output_usd_per_million: float = JEV_OUTPUT_USD_PER_MILLION
+    usage_complete: bool = False
+    cost_complete: bool = False
+
+
+class SessionStats(_StrictModel):
+    """CLI session totals, including cleanup and failed model calls."""
+
+    duration_ms: int = 0
+    actions: int = 0
+    assertions_passed: int = 0
+    assertions_failed: int = 0
+    screenshots_saved: int = 0
+    jev: JevUsage = Field(default_factory=JevUsage)
+
+
 class Report(_StrictModel):
     """Machine-readable QA report."""
 
@@ -401,3 +447,11 @@ class Report(_StrictModel):
     findings: dict[str, tuple[str, ...]] = Field(default_factory=dict)
     cleanup_notes: tuple[str, ...] = ()
     note: str | None = None
+    # Local screenshot records captured during the run. Capture is gated by
+    # the project's model_disclosure policy; ``screenshots_saved`` on
+    # session_stats tracks how many records are present in this tuple.
+    screenshots: tuple[ScreenshotRecord, ...] = ()
+    # Session-level aggregate counters. Populated by the CLI at end-of-run,
+    # including early-exit paths, so consumers always see a consistent
+    # shape even when no scenario steps were recorded.
+    session_stats: SessionStats = Field(default_factory=SessionStats)

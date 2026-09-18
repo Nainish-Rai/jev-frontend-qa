@@ -30,7 +30,7 @@ from .core.config import load_config
 from .core.decisions import TypeSafeDecisionProvider
 from .core.evidence import EvidenceCollector
 from .core.model_client import ModelClient, ModelError
-from .core.models import Policy, RedactionPolicy, Report, Scenario, StepResult
+from .core.models import JevUsage, Policy, RedactionPolicy, Report, Scenario, SessionStats, StepResult
 from .core.policy import PolicyEnforcer
 from .core.redaction import fixture_secrets, redact_report
 from .onboarding import add_commands
@@ -83,6 +83,31 @@ def build_parser() -> argparse.ArgumentParser:
     visibility = run.add_mutually_exclusive_group()
     visibility.add_argument("--headless", action="store_true", help="Run Chrome headless (default: headed)")
     visibility.add_argument("--headed", action="store_true", help="Force headed Chrome")
+    capture = run.add_mutually_exclusive_group()
+    capture.add_argument(
+        "--screenshots",
+        dest="screenshots",
+        action="store_true",
+        default=None,
+        help="Save app-state PNGs; requires policy allow_screenshots (default: follow policy)",
+    )
+    capture.add_argument(
+        "--no-screenshots",
+        dest="screenshots",
+        action="store_false",
+        help="Disable screenshot capture even when policy permits it",
+    )
+    run.add_argument(
+        "--screenshot-mode",
+        choices=("all", "actions", "steps", "failures"),
+        help="Capture lifecycle states (all), settled actions, step outcomes, or failed/blocked/error outcomes",
+    )
+    run.add_argument(
+        "--screenshot-every",
+        type=int,
+        metavar="N",
+        help="Capture every Nth settled action across the run, including cleanup; implies actions mode",
+    )
     run.add_argument("--attach-profile", default=None, help="Explicit policy-approved synthetic profile name")
     run.add_argument("--cdp-url", default=None, help="Explicit DevTools endpoint for the approved profile")
     run.add_argument("--model", type=str, default=None, help="Override the TypeSafe model id (default jev-1.13.0)")
@@ -128,12 +153,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     transport = None
     client = None
     started = int(time.time() * 1000)
+    session_started = time.monotonic()
     try:
         config = load_config(
             Path.cwd(),
             cli_overrides={
                 "chrome_executable": args.chrome_executable,
-                "headless": _resolve_headless(args),
+                "headless": args.headless,
                 "work_dir": args.work_dir,
                 "bu_name": args.bu_name,
             },
@@ -141,6 +167,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         scenario = load_scenario(args.scenario)
         policy = load_policy(args.policy)
         mode = validate_identity(policy, args.attach_profile, args.cdp_url)
+        if mode == "attach" and (args.headless or args.headed):
+            raise PolicyBlocked("Visibility flags cannot change an attached browser; omit them or use isolated mode")
+        capture_requested = (
+            args.screenshots is True or args.screenshot_mode is not None or args.screenshot_every is not None
+        )
+        if capture_requested and not policy.model_disclosure.allow_screenshots:
+            raise PolicyBlocked("Screenshot options require model_disclosure.allow_screenshots in project policy")
         enforcer = PolicyEnforcer(policy)
         if not enforcer.check_request("GET", str(scenario.start_url)).allowed:
             raise PolicyBlocked("Start URL is not permitted by project policy")
@@ -174,6 +207,13 @@ def cmd_run(args: argparse.Namespace) -> int:
             policy=policy,
             scenario=scenario,
             confidence_threshold=args.confidence_threshold,
+            screenshot_dir=(
+                args.report.parent / "screenshots" / scenario.run_id
+                if policy.model_disclosure.allow_screenshots and args.screenshots is not False
+                else None
+            ),
+            screenshot_mode=args.screenshot_mode or ("actions" if args.screenshot_every is not None else "all"),
+            screenshot_every=args.screenshot_every if args.screenshot_every is not None else 1,
         ).run()
         outcome = RunOutcome(
             report=outcome.report.model_copy(update={"execution_mode": mode}), exit_code=outcome.exit_code
@@ -208,6 +248,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             ),
             exit_code=EXIT_ERROR,
         )
+    stats = SessionStats(
+        duration_ms=max(0, int((time.monotonic() - session_started) * 1000)),
+        actions=sum(len(step.actions) for step in outcome.report.steps),
+        assertions_passed=sum(check.passed for step in outcome.report.steps for check in step.assertions),
+        assertions_failed=sum(not check.passed for step in outcome.report.steps for check in step.assertions),
+        screenshots_saved=len(outcome.report.screenshots),
+        jev=client.usage_summary() if client is not None else JevUsage(),
+    )
+    outcome = RunOutcome(report=outcome.report.model_copy(update={"session_stats": stats}), exit_code=outcome.exit_code)
     try:
         _emit_outcome(args, outcome, scenario=scenario, policy=policy)
     except OSError:
@@ -234,14 +283,6 @@ def cmd_help(_args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _resolve_headless(args: argparse.Namespace) -> bool:
-    if args.headless:
-        return True
-    if args.headed:
-        return False
-    return bool(load_config(Path.cwd()).chrome_headless)
-
-
 def load_scenario(path: Path) -> Scenario:
     payload = json.loads(path.read_text(encoding="utf-8"))
     return Scenario.model_validate(payload)
@@ -308,6 +349,44 @@ def _emit_outcome(
     with os.fdopen(descriptor, "w", encoding="utf-8") as output:
         output.write(json.dumps(payload, indent=2, sort_keys=True))
     print(json.dumps(payload, indent=2, sort_keys=True))
+    _print_session_summary(payload)
+
+
+def _print_session_summary(payload: dict) -> None:
+    """Keep stdout machine-readable; show only sanitized report data on stderr."""
+    stats = payload["session_stats"]
+    usage = stats["jev"]
+
+    def tokens(value: int | None) -> str:
+        return f"{value:,}" if value is not None else "unavailable"
+
+    cost = (
+        f"${usage['cost_usd']:.8f} USD (provider-reported)"
+        if usage["cost_usd"] is not None
+        else "unavailable (complete USD cost not reported by provider)"
+    )
+    estimate = (
+        f"${usage['estimated_cost_usd']:.10f} USD "
+        f"(input ${usage['input_usd_per_million']:g}/million, output ${usage['output_usd_per_million']:g}/million)"
+        if usage["estimated_cost_usd"] is not None
+        else "unavailable (token accounting incomplete)"
+    )
+    print(
+        f"\nJev QA session: {payload['verdict'].upper()}\n"
+        f"  Duration: {stats['duration_ms'] / 1000:.2f}s | Actions: {stats['actions']}\n"
+        f"  Assertions: {stats['assertions_passed']} passed, {stats['assertions_failed']} failed\n"
+        f"  Screenshots saved: {stats['screenshots_saved']}\n"
+        f"  Jev calls: {usage['requests']} | Failed calls: {usage['failed_requests']}\n"
+        f"  Jev request time: {usage['latency_ms'] / 1000:.2f}s\n"
+        f"  Tokens: input {tokens(usage['input_tokens'])}, output {tokens(usage['output_tokens'])}, "
+        f"total {tokens(usage['total_tokens'])}\n"
+        f"  Token accounting: {'complete' if usage['usage_complete'] else 'unavailable or incomplete'}\n"
+        f"  Estimated Jev cost: {estimate}\n"
+        f"  Provider-reported cost: {cost}",
+        file=sys.stderr,
+    )
+    if payload["screenshots"]:
+        print(f"  Screenshot files: {Path(payload['screenshots'][0]['path']).parent}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +402,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "validate":
         return cmd_validate(args)
     if args.command == "run":
+        if args.screenshot_every is not None:
+            if args.screenshot_every < 1:
+                parser.error("--screenshot-every must be a positive integer")
+            if args.screenshot_mode not in (None, "actions"):
+                parser.error("--screenshot-every can only be used with actions mode")
+        if args.screenshots is False and (args.screenshot_mode is not None or args.screenshot_every is not None):
+            parser.error("--no-screenshots conflicts with screenshot mode/frequency options")
         return cmd_run(args)
     parser.print_help()
     return EXIT_ERROR

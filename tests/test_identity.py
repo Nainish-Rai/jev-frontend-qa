@@ -337,6 +337,7 @@ def test_screenshots_require_policy_and_are_private(tmp_path, monkeypatch):
         transport.screenshot(path)
     assert not path.exists()
     transport.policy = policy(screenshots=True)
+    monkeypatch.setattr(transport, "evaluate_js", lambda _: ORIGIN)
     monkeypatch.setattr(
         transport, "_cdp", lambda *args, **kwargs: {"data": base64.b64encode(b"synthetic PNG").decode()}
     )
@@ -417,7 +418,11 @@ def test_cli_closes_client_and_transport_on_startup_failure(tmp_path, monkeypatc
             closed.append("transport")
 
     monkeypatch.setattr(cli, "_read_api_key", lambda: "synthetic-key")
-    monkeypatch.setattr(cli, "ModelClient", lambda **kwargs: SimpleNamespace(close=lambda: closed.append("client")))
+    monkeypatch.setattr(
+        cli,
+        "ModelClient",
+        lambda **kwargs: SimpleNamespace(close=lambda: closed.append("client"), usage_summary=lambda: cli.JevUsage()),
+    )
     monkeypatch.setattr(cli, "make_transport", lambda **kwargs: FailingTransport())
     assert (
         cli.main(argv + ["--attach-profile", "synthetic-demo", "--cdp-url", "http://127.0.0.1:9222"]) == cli.EXIT_ERROR

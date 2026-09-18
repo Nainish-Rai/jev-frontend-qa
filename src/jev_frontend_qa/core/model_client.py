@@ -24,6 +24,9 @@ from typing import Any, Self
 
 import httpx
 
+from .models import JevUsage
+from .usage import UsageRecorder
+
 DEFAULT_MODEL = "jev-1.13.0"
 API_URL = "https://api.typesafe.ai/v1/systemone"
 
@@ -88,10 +91,12 @@ class ModelClient:
     deadline: float | None = None
     _http: httpx.AsyncClient = field(init=False, repr=False)
     _loop: asyncio.Runner = field(init=False, repr=False)
+    _usage: UsageRecorder = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._loop = asyncio.Runner()
         self._http = httpx.AsyncClient(http2=True, timeout=self.timeout_seconds)
+        self._usage = UsageRecorder()
 
     @property
     def provider(self) -> str:
@@ -104,6 +109,10 @@ class ModelClient:
     def ensure_ready(self) -> None:
         if not self.api_key:
             raise ModelError("missing_key", "TYPESAFE_API_KEY is not set; cannot make model calls.")
+
+    def usage_summary(self) -> JevUsage:
+        """Return safe aggregate counters, retained after close()."""
+        return self._usage.summary()
 
     def close(self) -> None:
         if not self._http.is_closed:
@@ -138,12 +147,7 @@ class ModelClient:
         operations: dict[str, str],
         targets: dict[str, dict[str, Any]],
     ) -> Decision:
-        """Submit one batched request and return the chosen branch.
-
-        ``operations`` and ``targets`` come from :func:`action_space`. The
-        caller MUST consume only the chosen branch.
-        """
-
+        """Submit one batched request, accounting even rejected typed answers."""
         self.ensure_ready()
         timeout = self.timeout_seconds
         if self.deadline is not None:
@@ -151,56 +155,51 @@ class ModelClient:
         if timeout <= 0:
             raise ModelError("timeout", "Scenario deadline reached before model call.")
         body = self._build_body(
-            goal=goal,
-            page=page,
-            history=history,
-            elements=elements,
-            operations=operations,
-            targets=targets,
+            goal=goal, page=page, history=history, elements=elements, operations=operations, targets=targets
         )
         started = time.perf_counter()
+        payload = None
+        failed = True
         try:
-            response = self._loop.run(self._post(body, timeout))
-        except (httpx.TimeoutException, TimeoutError):
-            raise ModelError("timeout", "TypeSafe request timed out; no action executed.") from None
-        except httpx.HTTPError:
-            raise ModelError("provider_error", "TypeSafe connection failed; no action executed.") from None
-        if self.deadline is not None and time.monotonic() >= self.deadline:
-            raise ModelError("timeout", "Scenario deadline reached during model call.")
-
-        if response.status_code in {401, 403}:
-            raise ModelError(
-                "provider_error",
-                "TypeSafe rejected the API key.",
-                http_status=response.status_code,
+            try:
+                response = self._loop.run(self._post(body, timeout))
+            except (httpx.TimeoutException, TimeoutError):
+                raise ModelError("timeout", "TypeSafe request timed out; no action executed.") from None
+            except httpx.HTTPError:
+                raise ModelError("provider_error", "TypeSafe connection failed; no action executed.") from None
+            # Read usage before status/deadline/answer validation can reject this call.
+            try:
+                payload = response.json()
+            except ValueError:
+                pass
+            if self.deadline is not None and time.monotonic() >= self.deadline:
+                raise ModelError("timeout", "Scenario deadline reached during model call.")
+            if response.status_code in {401, 403}:
+                raise ModelError("provider_error", "TypeSafe rejected the API key.", http_status=response.status_code)
+            if response.status_code >= 400:
+                raise ModelError(
+                    "provider_error",
+                    f"TypeSafe returned HTTP {response.status_code}.",
+                    http_status=response.status_code,
+                )
+            if not isinstance(payload, dict) or not isinstance(payload.get("answers"), dict):
+                raise ModelError("invalid_choice", "TypeSafe response is missing valid typed answers.")
+            decision = self._consume(
+                payload=payload,
+                operations=operations,
+                targets=targets,
+                goal=goal,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                request=body,
             )
-        if response.status_code >= 500:
-            raise ModelError(
-                "provider_error",
-                f"TypeSafe returned HTTP {response.status_code}.",
-                http_status=response.status_code,
+            failed = False
+            return decision
+        finally:
+            self._usage.record(
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                failed=failed,
+                usage=payload.get("usage") if isinstance(payload, dict) else None,
             )
-        if response.status_code >= 400:
-            raise ModelError(
-                "provider_error",
-                f"TypeSafe returned HTTP {response.status_code}.",
-                http_status=response.status_code,
-            )
-
-        try:
-            payload = response.json()
-        except ValueError:
-            raise ModelError("invalid_choice", "TypeSafe returned invalid JSON; no action executed.") from None
-        if not isinstance(payload, dict) or not isinstance(payload.get("answers"), dict):
-            raise ModelError("invalid_choice", "TypeSafe response is missing typed answers.")
-        return self._consume(
-            payload=payload,
-            operations=operations,
-            targets=targets,
-            goal=goal,
-            latency_ms=int((time.perf_counter() - started) * 1000),
-            request=body,
-        )
 
     # ----- helpers -------------------------------------------------------
     def _build_body(

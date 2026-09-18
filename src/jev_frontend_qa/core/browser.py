@@ -626,11 +626,47 @@ class BrowserTransport:
     def screenshot(self, path: Path) -> None:
         if not self.policy.model_disclosure.allow_screenshots:
             raise PolicyBlocked("Screenshot capture is not permitted")
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.open not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
+            raise OSError("Secure screenshot storage requires directory-descriptor support")
+        current_url = self.evaluate_js("location.href")
+        if (
+            not isinstance(current_url, str)
+            or not PolicyEnforcer(self.policy).check_request("GET", current_url).allowed
+        ):
+            raise PolicyBlocked("Screenshot page is not permitted")
+        capture_rules = self.policy.network.capture_origins
+        parts = urlsplit(current_url)
+        if capture_rules is not None and not any(
+            str(rule.origin).rstrip("/") == f"{parts.scheme}://{parts.netloc}"
+            and "GET" in rule.methods
+            and parts.path.startswith(rule.path_prefix)
+            for rule in capture_rules
+        ):
+            raise PolicyBlocked("Screenshot page is not permitted by capture policy")
         data = base64.b64decode(self._cdp("Page.captureScreenshot", format="png")["data"], validate=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as output:
-            output.write(data)
+        if self.evaluate_js("location.href") != current_url:
+            raise PolicyBlocked("Screenshot page changed during capture")
+        # Walk with directory descriptors: symlinked parents cannot redirect writes.
+        absolute = Path(os.path.abspath(path))
+        directory = os.open(absolute.anchor, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in absolute.parent.parts[1:]:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=directory)
+                except FileExistsError:
+                    pass
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                os.close(directory)
+                directory = child
+            fd = os.open(absolute.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+            try:
+                with os.fdopen(fd, "wb") as output:
+                    output.write(data)
+            except BaseException:
+                os.unlink(absolute.name, dir_fd=directory)
+                raise
+        finally:
+            os.close(directory)
 
     def drain_evidence(self) -> tuple[list[dict], int]:
         response = self._ipc_call({"meta": "drain_evidence", "settle_seconds": self._remaining(2)})
