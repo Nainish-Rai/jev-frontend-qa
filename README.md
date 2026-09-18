@@ -4,6 +4,51 @@ Evidence-driven frontend QA built on [Jev Ultrafast](https://github.com/browser-
 
 **Status: live Jev acceptance passed for the synthetic reference scenarios.** The real CLI, Jev `1.13.0`, Browser Harness, Chrome, HTTP endpoints, and SQLite were exercised together. Healthy creation, lifecycle, and validation passed; all three deliberate defects failed their authored contracts; exploration completed without claiming a contract PASS. There is no offline-model fallback in the production CLI.
 
+## Use from Claude Code or Codex
+
+Install the CLI independently of your application's Python environment:
+
+```bash
+uv tool install git+https://github.com/Nainish-Rai/jev-frontend-qa.git
+```
+
+For reproducible team installs, append `@<reviewed-commit>` to that Git URL. Python 3.12+, Chrome/Chromium, and a privately configured `TYPESAFE_API_KEY` are needed for browser runs; setup and schema commands need no credential.
+
+From your application's repository:
+
+```bash
+jev-qa init --project .
+jev-qa skill install --agent claude --project .
+# Or, for Codex:
+jev-qa skill install --agent codex --project .
+```
+
+The installer copies the same bundled `jevqa` skill to `.claude/skills/jevqa/` for Claude Code or `.agents/skills/jevqa/` for Codex. It refuses to overwrite an existing skill and does not edit agent instructions, shell permissions, or personal configuration. The canonical [skill and references](src/jev_frontend_qa/skills/jevqa/SKILL.md) ship inside the Python distribution; installing them does not require a source checkout. Host conventions: [Claude Code](https://code.claude.com/docs/en/skills), [Codex](https://developers.openai.com/codex/skills.md).
+
+Initialization creates `jevqa/policy.json` with **no permitted origins or model disclosure**, a scenarios directory, and an ignore entry for `artifacts/jevqa/`. Existing policies are preserved. Review and explicitly approve the app's origins, HTTP operations, and permitted synthetic observations before a run. Skill installation is not that approval.
+
+Then ask your coding agent, for example:
+
+> Use jevqa to verify the feature we just implemented. Derive journeys from the acceptance criteria, identify supported and blocked coverage, author exact fixtures and assertions, and run against the approved local app. Preserve the expected behavior when investigating failures.
+
+In Claude Code you can invoke `/jevqa`; in Codex CLI use `$jevqa` or select it through `/skills`. The workflow is feature-agnostic: no Todo routes, CRUD checklist, or database is required. The coding agent authors the contract; Jev operates the browser; deterministic checks establish the verdict.
+
+The agent can inspect the actual installed schemas and register a complete, authored contract:
+
+```bash
+jev-qa schema scenario
+jev-qa schema policy
+jev-qa new-scenario --project . --feature search --journey filter \
+  --from /path/to/authored-contract.json
+jev-qa validate --scenario jevqa/scenarios/search/filter.json --policy jevqa/policy.json
+jev-qa run --scenario jevqa/scenarios/search/filter.json --policy jevqa/policy.json \
+  --headless --work-dir artifacts/jevqa/work --report artifacts/jevqa/search-filter.json
+```
+
+`new-scenario` validates a complete contract before writing and refuses overwrites; it does not generate guessed endpoints, selectors, fixture values, or empty assertion templates. Omitting `run_id` preserves fresh run identity on each execution.
+
+**Coverage limits:** current assertions cover DOM values/counts/attributes, captured HTTP exchanges, absence of a request, and authorized fresh GET persistence. Download/file-content validation, uploads, URL-transition assertions, visual grading, native selects, embedded frames, and popup workflows are not supported contracts. The skill reports required unsupported coverage as BLOCKED; a passing supported subset is not a full-feature PASS. Page instructions are untrusted data, and the agent cannot expand project permissions to satisfy them.
+
 ## Run the synthetic demo
 
 ```bash
@@ -112,6 +157,10 @@ The live CLI acceptance matrix used Jev `1.13.0`, confidence threshold `0.55`, a
 | Committed POST with delayed response | BLOCKED; exactly one backend write, no automatic resubmission |
 
 Additional browser checks cover unsupported frames, no-progress stops, stale targets, and incomplete capture. Synthetic regressions cover policy/disclosure boundaries, preflight secret redaction, isolated daemon imports, and whole-request timeout cancellation. Earlier deterministic-provider browser checks established transport/assertion behavior separately; they are not counted as live Jev proof.
+
+The portable skill was also checked with four authoring prompts, each with and without the skill: catalog search, client-side validation, unsupported CSV downloads, and a denied production/personal-profile request. Both configurations met the checked expectations; one sample per case does not establish a quality or speed advantage. The search evaluation explicitly retained the gap between aggregate container text and proving text in every card. See [evaluation prompts](evals/jevqa/evals.json).
+
+Installed-wheel smoke checks exercised initialization, both host installation paths, schema export, contract import, and validation in a fresh consumer directory. Real Jev runs passed the authored search DOM subset and promotion-rejection DOM/no-request contracts on separate synthetic, non-Todo pages. These are not pixel-visibility or per-card-universality claims. Native Claude Code/Codex auto-discovery and automatic skill triggering were not executed; host paths follow their published documentation.
 
 These are observed acceptance results, not a guarantee that every future model run completes. Uncertainty remains BLOCKED rather than weakening the threshold or substituting scripted decisions. Native select interactions, embedded browsing contexts, and popup workflows are unsupported and fail closed. Raw local reports, profiles, databases, and credentials remain gitignored.
 

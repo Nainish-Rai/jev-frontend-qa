@@ -33,6 +33,7 @@ from .core.model_client import ModelClient, ModelError
 from .core.models import Policy, RedactionPolicy, Report, Scenario, StepResult
 from .core.policy import PolicyEnforcer
 from .core.redaction import fixture_secrets, redact_report
+from .onboarding import add_commands
 
 EXIT_PASS = 0
 EXIT_FAIL = 1
@@ -98,6 +99,8 @@ def build_parser() -> argparse.ArgumentParser:
     validate = sub.add_parser("validate", help="Validate the scenario and policy JSON without running the browser.")
     validate.add_argument("--scenario", type=Path, required=True)
     validate.add_argument("--policy", type=Path, required=True)
+
+    add_commands(sub)
 
     sub.add_parser("help", help="Print the help for the available subcommands.")
 
@@ -313,6 +316,8 @@ def _emit_outcome(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if handler := getattr(args, "handler", None):
+        return handler(args)
     if args.command is None or args.command == "help":
         return cmd_help(args)
     if args.command == "validate":
