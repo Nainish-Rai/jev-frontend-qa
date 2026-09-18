@@ -90,10 +90,10 @@ def _evaluate_one(
     policy: Policy,
 ) -> AssertionOutcome:
     if isinstance(assertion, (EqualsAssertion, ContainsAssertion, CountAssertion, AttributeAssertion)):
-        return _evaluate_value(name, assertion, transport, evidence)
+        return _evaluate_value(name, assertion, transport)
     if isinstance(assertion, PersistenceAssertion):
         return _evaluate_persistence(name, assertion, fresh_page_payloads, policy)
-    candidates = _matching_records(evidence, method=assertion.method, path=assertion.path)
+    candidates = matching_exchanges(evidence, method=assertion.method, path=assertion.path)
     if isinstance(assertion, NoRequestAssertion):
         return AssertionOutcome(
             name=name,
@@ -138,18 +138,17 @@ def _evaluate_one(
     )
 
 
-def _matching_records(
+def matching_exchanges(
     evidence: Sequence[EvidenceRecord],
     *,
-    method: str | None,
-    path: str | None,
+    method: str,
+    path: str,
 ) -> list[EvidenceRecord]:
     # Endpoint identity is exact. /todos/1 must never match /todos/10.
     return [
         record
         for record in evidence
-        if (method is None or record.method.upper() == method.upper())
-        and (path is None or (urlsplit(record.url).path or "/") == path)
+        if record.method.upper() == method.upper() and (urlsplit(record.url).path or "/") == path
     ]
 
 
@@ -157,7 +156,7 @@ def _network_failures(assertion: NetworkAssertion, candidate: EvidenceRecord) ->
     failures = []
     if candidate.error or candidate.incomplete or candidate.status is None:
         failures.append("captured exchange is incomplete or failed")
-    if assertion.expected_status is not None and candidate.status != assertion.expected_status:
+    if candidate.status != assertion.expected_status:
         failures.append(f"expected status {assertion.expected_status}, observed {candidate.status}")
     if assertion.payload_contains is not None and not _matches_expected(
         candidate.request_body, assertion.payload_contains
@@ -183,7 +182,7 @@ def capture_network_variables(
     for assertion in assertions:
         if not isinstance(assertion, NetworkAssertion) or not assertion.capture:
             continue
-        candidates = _matching_records(evidence, method=assertion.method, path=assertion.path)
+        candidates = matching_exchanges(evidence, method=assertion.method, path=assertion.path)
         if len(candidates) != 1 or _network_failures(assertion, candidates[0]):
             raise ValueError("capture requires exactly one complete exchange satisfying its network contract")
         for name, path in assertion.capture.items():
@@ -204,45 +203,29 @@ def _evaluate_value(
     name: str,
     assertion: EqualsAssertion | ContainsAssertion | CountAssertion | AttributeAssertion,
     transport: BrowserTransport | None,
-    evidence: Sequence[EvidenceRecord],
 ) -> AssertionOutcome:
-    if assertion.selector is not None:
-        if transport is None:
-            return AssertionOutcome(name, assertion.kind, False, detail="no DOM transport")
-        values = _read_dom_values(
-            transport, assertion.selector, assertion.name if isinstance(assertion, AttributeAssertion) else None
+    if transport is None:
+        return AssertionOutcome(name, assertion.kind, False, detail="no DOM transport")
+    values = _read_dom_values(
+        transport, assertion.selector, assertion.name if isinstance(assertion, AttributeAssertion) else None
+    )
+    if not isinstance(values, list):
+        return AssertionOutcome(name, assertion.kind, False, detail="DOM observation unavailable")
+    if isinstance(assertion, CountAssertion):
+        observed = len(values)
+    elif len(values) != 1:
+        return AssertionOutcome(
+            name,
+            assertion.kind,
+            False,
+            expected=assertion.expected,
+            observed=values,
+            detail="value selector must identify exactly one element; use count for absence",
         )
-        if not isinstance(values, list):
-            return AssertionOutcome(name, assertion.kind, False, detail="DOM observation unavailable")
-        if isinstance(assertion, CountAssertion):
-            observed = len(values)
-        elif len(values) != 1:
-            return AssertionOutcome(
-                name,
-                assertion.kind,
-                False,
-                expected=assertion.expected,
-                observed=values,
-                detail="value selector must identify exactly one element; use count for absence",
-            )
-        else:
-            observed = values[0]
     else:
-        candidates = [
-            record
-            for record in evidence
-            if not record.incomplete
-            and not record.error
-            and record.status is not None
-            and record.response_body is not None
-        ]
-        if not candidates:
-            return AssertionOutcome(name, assertion.kind, False, detail="no complete response body")
-        observed = _jsonpath_lookup(candidates[-1].response_body, assertion.jsonpath.path)
-        if observed is None:
-            return AssertionOutcome(name, assertion.kind, False, detail="JSON target unavailable")
+        observed = values[0]
     if isinstance(assertion, ContainsAssertion):
-        passed = _container_contains(observed, None, assertion.expected)
+        passed = _container_contains(observed, assertion.expected)
     else:
         passed = _exact_equal(observed, assertion.expected)
     return AssertionOutcome(name, assertion.kind, passed, assertion.expected, observed)
@@ -316,9 +299,7 @@ def _matches_expected(actual: Any, expected: Any) -> bool:
     return _exact_equal(actual, expected)
 
 
-def _container_contains(container: Any, key: str | None, value: Any) -> bool:
-    if key is not None:
-        return isinstance(container, Mapping) and key in container and _matches_expected(container[key], value)
+def _container_contains(container: Any, value: Any) -> bool:
     if isinstance(container, str) and isinstance(value, str):
         return value in container
     if isinstance(container, Mapping) and isinstance(value, Mapping):

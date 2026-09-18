@@ -10,19 +10,19 @@ import json
 import math
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 from urllib.parse import urlsplit
 
-from .assertions import AssertionOutcome, capture_network_variables, evaluate_step
+from .assertions import AssertionOutcome, capture_network_variables, evaluate_step, matching_exchanges
 from .browser import BrowserTransport
 from .decisions import DecisionProvider, model_name_from_provider, provider_label
 from .evidence import EvidenceRecord
 from .model_client import ModelError
-from .models import ActionRecord, AssertionResult, Policy, Report, Scenario, Step, StepResult
+from .models import ActionRecord, Assertion, AssertionResult, Policy, Report, Scenario, Step, StepResult
 from .policy import PolicyEnforcer
-from .redaction import redact_report
+from .redaction import fixture_secrets, redact_report
 from .snapshot import PageState, read_snapshot
 
 INTERPOLATION_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
@@ -74,7 +74,11 @@ class Runner:
         self._variables = {"run_id": self.scenario.run_id}
         self._owned_captures: set[str] = set()
         self._metadata: dict[str, str] = {}
-        self._secrets: set[str] = set()
+        self._secrets = {
+            value
+            for step in (*self.scenario.steps, *self.scenario.cleanup)
+            for value in fixture_secrets(step.fixtures, self.policy.redaction)
+        }
         api_key = getattr(getattr(self.provider, "client", None), "api_key", None)
         if api_key:
             self._secrets.add(api_key)
@@ -185,8 +189,7 @@ class Runner:
             for key in ready:
                 variables[key] = interpolate_fixtures(pending.pop(key), variables)
         fixtures = {key: variables[key] for key in step.fixtures}
-        sensitive = {key.lower() for key in self.policy.redaction.redact_body_fields}
-        self._secrets.update(value for key, value in fixtures.items() if key.lower() in sensitive and value)
+        self._secrets.update(fixture_secrets(fixtures, self.policy.redaction))
         goal = interpolate_fixtures(step.goal, variables)
         scope = step.scope
         if scope is not None:
@@ -217,6 +220,9 @@ class Runner:
                     if ctx.step.skip_if_absent or (ctx.actions and ctx.step.assertions):
                         return self._evaluate_step(ctx)
                     raise RunBlocked("Caller-owned action scope is absent or ambiguous")
+                if self.scenario.mode == "contract" and ctx.actions and self._contract_ready(ctx):
+                    self._record_observation(ctx, page)
+                    return self._evaluate_step(ctx)
                 if previous_fingerprint == page.fingerprint:
                     stagnant += 1
                 else:
@@ -228,21 +234,18 @@ class Runner:
                 confidences = [decision.confidence]
                 if decision.target_confidence is not None:
                     confidences.append(decision.target_confidence)
-                if any(not math.isfinite(value) or value < self.confidence_threshold for value in confidences):
-                    raise RunBlocked("Selected operation or target confidence is below the configured threshold")
                 self._findings["model_judgments"].append(
                     f"{ctx.step.id}: {decision.operation}, confidence {min(confidences):.3f}; not a correctness verdict"
                 )
+                if any(not math.isfinite(value) or value < self.confidence_threshold for value in confidences):
+                    raise RunBlocked("Selected operation or target confidence is below the configured threshold")
                 if decision.operation in {"BLOCKED", "NONE", "NO_MATCH", "UNSUPPORTED"} or decision.choice in {
                     "NONE",
                     "NO_MATCH",
                 }:
                     raise RunBlocked("Model reported no supported matching operation or target")
                 if decision.operation == "DONE":
-                    self._findings["observed_facts"].append(
-                        f"{ctx.step.id}: observed page {page.url} with title {page.title!r}"
-                    )
-                    self._findings["observed_facts"].append(f"{ctx.step.id}: visible page text {page.text!r}")
+                    self._record_observation(ctx, page)
                     return self._evaluate_step(ctx)
                 action = next((item for item in page.actions if str(item.get("id")) == decision.choice), None)
                 if action is None:
@@ -303,6 +306,35 @@ class Runner:
         except (RunBlocked, ModelError, OSError, RuntimeError, ValueError, TypeError, LookupError) as error:
             return self._finalize_step(ctx, self._error_status(error), self._safe_error_message(error))
 
+    def _record_observation(self, ctx: _StepContext, page: PageState) -> None:
+        self._findings["observed_facts"].append(f"{ctx.step.id}: observed page {page.url} with title {page.title!r}")
+        self._findings["observed_facts"].append(f"{ctx.step.id}: observed scope/page text {page.text!r}")
+
+    def _contract_ready(self, ctx: _StepContext) -> bool:
+        positives = tuple(
+            type(assertion).model_validate(_interpolate_structure(assertion.model_dump(), ctx.variables))
+            for assertion in ctx.step.assertions
+            if assertion.kind in {"network", "status"}
+        )
+        if any(not matching_exchanges(ctx.evidence_records, method=item.method, path=item.path) for item in positives):
+            return False
+        if any(not outcome.passed for outcome in self._check_assertions(ctx, positives)):
+            return True
+        captured = capture_network_variables(positives, ctx.evidence_records)
+        variables = ctx.variables | captured if captured else ctx.variables
+        immediate = tuple(
+            type(assertion).model_validate(_interpolate_structure(assertion.model_dump(), variables))
+            for assertion in ctx.step.assertions
+            if assertion.kind not in {"network", "status", "persistence"}
+        )
+        outcomes = self._check_assertions(ctx, immediate)
+        if any(outcome.kind == "no_request" and not outcome.passed for outcome in outcomes):
+            return True
+        # Absence alone is not a completion signal. Require an observed UI/API anchor;
+        # successful HTTP alone cannot finish while an authored UI state is still pending.
+        anchored = bool(positives) or any(outcome.kind != "no_request" for outcome in outcomes)
+        return anchored and all(outcome.passed for outcome in outcomes)
+
     def _choose(self, ctx: _StepContext, page: PageState, history: list[dict[str, Any]]):
         self._require_observation_policy()
         remaining = self._remaining()
@@ -315,7 +347,18 @@ class Runner:
             goal += "\nCaller-supplied exact fixtures: " + json.dumps(ctx.fixtures, ensure_ascii=False)
         decision = self.provider.choose(
             goal=self._redact(goal),
-            page=self._redact({"url": page.url, "title": page.title, "text": page.text, "actions": list(page.actions)}),
+            page=self._redact(
+                {
+                    "url": page.url,
+                    "title": page.title,
+                    "text": page.text,
+                    "width": page.width,
+                    "height": page.height,
+                    "scroll": page.scroll,
+                    "scope": ctx.step.scope.model_dump(exclude_none=True) if ctx.step.scope else None,
+                    "actions": list(page.actions),
+                }
+            ),
             history=self._redact(history) if self.policy.model_disclosure.allow_action_history else [],
         )
         self._remaining()
@@ -324,6 +367,14 @@ class Runner:
     def _evaluate_step(self, ctx: _StepContext) -> StepResult:
         self._drain_evidence_into_records(ctx)
         self._require_complete_evidence(ctx)
+        if not ctx.actions:
+            for assertion in ctx.step.assertions:
+                if assertion.kind in {"network", "status"} and not matching_exchanges(
+                    ctx.evidence_records,
+                    method=assertion.method,
+                    path=_interpolate_structure(assertion.path, ctx.variables),
+                ):
+                    raise RunBlocked("Step stopped before exercising a required API interaction")
         networks = tuple(
             type(assertion).model_validate(_interpolate_structure(assertion.model_dump(), ctx.variables))
             for assertion in ctx.step.assertions
@@ -371,12 +422,19 @@ class Runner:
         ctx.outcomes.extend(self._assertions(ctx, immediate))
         fresh_paths = tuple(dict.fromkeys(assertion.path for assertion in persistence))
         if ctx.step.reload_after or fresh_paths:
+            previous_evidence_count = len(ctx.evidence_records)
             try:
                 self._reload_and_collect_fresh(ctx, fresh_paths)
             except Exception:
                 self._drain_evidence_into_records(ctx)
                 self._require_complete_evidence(ctx)
-                if not any(record.status is not None and record.status >= 400 for record in ctx.evidence_records):
+                if not any(
+                    record.method == "GET"
+                    and urlsplit(record.url).path in fresh_paths
+                    and record.status is not None
+                    and record.status >= 400
+                    for record in ctx.evidence_records[previous_evidence_count:]
+                ):
                     raise
                 ctx.outcomes.extend(self._assertions(ctx, persistence))
                 return self._result(ctx, "fail", "Fresh read failed with a captured application HTTP error")
@@ -390,7 +448,21 @@ class Runner:
         status = "complete" if self.scenario.mode == "exploratory" else "pass"
         return self._result(ctx, status, None)
 
-    def _assertions(self, ctx: _StepContext, assertions) -> list[AssertionOutcome]:
+    def _check_assertions(self, ctx: _StepContext, assertions: Sequence[Assertion]) -> list[AssertionOutcome]:
+        return evaluate_step(
+            step_id=ctx.step.id,
+            step_goal=ctx.goal,
+            assertions=assertions,
+            evidence=ctx.evidence_records,
+            fresh_page_payloads=ctx.fresh_payloads,
+            transport=self.transport
+            if not ctx.evidence_problem and time.monotonic() < self._scenario_deadline
+            else None,
+            policy=self.policy,
+            evidence_complete=not ctx.evidence_problem,
+        )
+
+    def _assertions(self, ctx: _StepContext, assertions: Sequence[Assertion]) -> list[AssertionOutcome]:
         outcomes = []
         for assertion in assertions:
             index = next(
@@ -399,18 +471,7 @@ class Runner:
                 if original.kind == assertion.kind and index not in ctx.evaluated_assertions
             )
             try:
-                outcome = evaluate_step(
-                    step_id=ctx.step.id,
-                    step_goal=ctx.goal,
-                    assertions=(assertion,),
-                    evidence=ctx.evidence_records,
-                    fresh_page_payloads=ctx.fresh_payloads,
-                    transport=self.transport
-                    if not ctx.evidence_problem and time.monotonic() < self._scenario_deadline
-                    else None,
-                    policy=self.policy,
-                    evidence_complete=not ctx.evidence_problem,
-                )[0]
+                outcome = self._check_assertions(ctx, (assertion,))[0]
             except Exception:
                 ctx.outcomes.extend(outcomes)
                 raise
@@ -480,17 +541,27 @@ class Runner:
         query = _scope_query(ctx.step)
         result = self.transport.evaluate_js(
             "(() => { const roots=" + query + "; if(roots.length!==1) return {count:roots.length,nodes:[]};"
-            " const c=window.__jevFast; return {count:1,nodes:[...c.nodes].filter(([id,e])=>roots[0].contains(e)).map(([id])=>id)}; })()"
+            " const root=roots[0], c=window.__jevFast;"
+            " const ids=new Set([root,...root.querySelectorAll('[aria-describedby]')].flatMap("
+            " e=>(e.getAttribute('aria-describedby')||'').split(/\\s+/)));"
+            " const extra=[...ids].map(id=>document.getElementById(id)).filter(e=>e&&!root.contains(e));"
+            " const text=[root.innerText,...extra.map(e=>e.innerText)].join('\\n').slice(0,6001);"
+            " return {count:1,text,nodes:[...c.nodes].filter(([id,e])=>root.contains(e)).map(([id])=>id)}; })()"
         )
         if not isinstance(result, dict) or result.get("count", 0) > 1:
             raise RunBlocked("Caller-owned action scope is ambiguous or unavailable")
         if result["count"] == 0:
             return page, False
+        if not isinstance(result.get("text"), str) or len(result["text"]) > 6000:
+            raise RunBlocked("Caller-owned scope text is unavailable or truncated")
         allowed_nodes = set(result["nodes"])
         return replace(
             page,
+            text=result["text"],
             actions=tuple(
-                action
+                {**action, "reveals": [item for item in action.get("reveals", ()) if item["node"] in allowed_nodes]}
+                if action.get("kind") == "scroll"
+                else action
                 for action in page.actions
                 if action.get("node") in allowed_nodes or action.get("kind") in {"wait", "scroll"}
             ),

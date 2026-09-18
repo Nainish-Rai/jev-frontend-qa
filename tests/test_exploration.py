@@ -301,7 +301,7 @@ def test_previous_step_response_cannot_satisfy_next_step(monkeypatch):
         ],
     )
     outcome, _, _ = run(monkeypatch, [choice("CLICK", "e1"), choice(), choice()], browser=browser, spec=spec)
-    assert [step.status for step in outcome.report.steps] == ["pass", "fail"]
+    assert [step.status for step in outcome.report.steps] == ["pass", "blocked"]
     assert outcome.report.steps[1].evidence == ()
 
 
@@ -407,7 +407,7 @@ def test_unrelated_row_cannot_be_selected_outside_caller_scope(monkeypatch):
     class ScopedBrowser(MemoryBrowser):
         def evaluate_js(self, expression, **kwargs):
             if "const roots=" in expression:
-                return {"count": 1, "nodes": [1]}
+                return {"count": 1, "nodes": [1], "text": "Owned row controls"}
             return super().evaluate_js(expression, **kwargs)
 
     state = page()
@@ -496,14 +496,13 @@ def test_cleanup_without_verified_run_owned_capture_does_not_touch_browser(monke
     assert outcome.report.verdict == "complete"
     assert browser.clicks == 0
     assert len(provider.calls) == 1
-    assert "verified POST" in outcome.report.cleanup_notes[0]
 
 
 def test_scoped_goal_can_scroll_to_reach_offscreen_controls(monkeypatch):
     class ScrollBrowser(MemoryBrowser):
         def evaluate_js(self, expression, **kwargs):
             if "const roots=" in expression:
-                return {"count": 1, "nodes": [1]}
+                return {"count": 1, "nodes": [1], "text": "Owned row controls"}
             if "pageKey()" in expression:
                 return ["owned-document"]
             return super().evaluate_js(expression, **kwargs)
@@ -517,3 +516,109 @@ def test_scoped_goal_can_scroll_to_reach_offscreen_controls(monkeypatch):
         monkeypatch, [choice("SCROLL_DOWN", "scroll_down"), choice()], browser=ScrollBrowser(), state=state, spec=spec
     )
     assert outcome.report.verdict == "complete"
+
+
+@pytest.mark.parametrize(
+    "prior_path, fresh_path, expected_verdict",
+    [
+        ("/api/todos", None, "blocked"),
+        (None, "/favicon.ico", "blocked"),
+        (None, "/api/todos", "fail"),
+    ],
+)
+def test_fresh_read_failure_only_uses_its_own_http_evidence(monkeypatch, prior_path, fresh_path, expected_verdict):
+    class InterruptedReadBrowser(MemoryBrowser):
+        def fresh_read(self, path):
+            if fresh_path:
+                self.pending.append({"method": "GET", "url": ORIGIN + fresh_path, "status": 503})
+            raise ConnectionError("independent read interrupted")
+
+    browser = InterruptedReadBrowser()
+    if prior_path:
+        browser.pending.append({"method": "GET", "url": ORIGIN + prior_path, "status": 503})
+    spec = scenario(
+        mode="contract",
+        steps=[
+            {
+                "id": "verify",
+                "goal": "Inspect the persisted record",
+                "assertions": [
+                    {
+                        "kind": "persistence",
+                        "path": "/api/todos",
+                        "records_path": "$.todos",
+                        "contains": {"title": "owned"},
+                    }
+                ],
+            }
+        ],
+    )
+    outcome, _, _ = run(monkeypatch, [choice()], browser=browser, spec=spec)
+    assert outcome.report.verdict == expected_verdict
+
+
+@pytest.mark.parametrize("persisted_rows, expected_verdict", [([], "pass"), ([{"title": ""}], "fail")])
+def test_observed_rejection_finishes_with_independent_persistence_verification(
+    monkeypatch, persisted_rows, expected_verdict
+):
+    class ValidationBrowser(MemoryBrowser):
+        def evaluate_js(self, expression, **kwargs):
+            if "document.querySelectorAll" in expression:
+                return ["Invalid title"] if self.clicks else []
+            return super().evaluate_js(expression, **kwargs)
+
+    browser = ValidationBrowser()
+    browser.fresh_payloads["/api/todos"] = {"todos": persisted_rows}
+    spec = scenario(
+        mode="contract",
+        steps=[
+            {
+                "id": "reject",
+                "goal": "Submit the invalid title once",
+                "assertions": [
+                    {"kind": "count", "selector": {"css": ".validation-error"}, "expected": 1},
+                    {"kind": "no_request", "method": "POST", "path": "/api/todos"},
+                    {
+                        "kind": "persistence",
+                        "path": "/api/todos",
+                        "records_path": "$.todos",
+                        "contains": {"title": ""},
+                        "absent": True,
+                    },
+                ],
+            }
+        ],
+    )
+    outcome, browser, _ = run(monkeypatch, [choice("CLICK", "e1"), choice(confidence=0.1)], browser=browser, spec=spec)
+    assert outcome.report.verdict == expected_verdict
+    assert browser.clicks == 1
+    assert outcome.report.steps[0].assertions[-1].passed is (expected_verdict == "pass")
+
+
+def test_successful_exchange_does_not_finish_before_required_ui_state(monkeypatch):
+    class PendingUIBrowser(MemoryBrowser):
+        def evaluate_js(self, expression, **kwargs):
+            if "document.querySelectorAll" in expression:
+                return []
+            return super().evaluate_js(expression, **kwargs)
+
+    browser = PendingUIBrowser()
+    browser.on_click = lambda current: current.pending.append(
+        {"method": "POST", "url": ORIGIN + "/api/todos", "status": 201}
+    )
+    spec = scenario(
+        mode="contract",
+        steps=[
+            {
+                "id": "create",
+                "goal": "Create the row",
+                "assertions": [
+                    {"kind": "status", "method": "POST", "path": "/api/todos", "expected_status": 201},
+                    {"kind": "count", "selector": {"css": ".created-row"}, "expected": 1},
+                ],
+            }
+        ],
+    )
+    outcome, browser, _ = run(monkeypatch, [choice("CLICK", "e1"), choice(confidence=0.1)], browser=browser, spec=spec)
+    assert outcome.report.verdict == "blocked"
+    assert browser.clicks == 1

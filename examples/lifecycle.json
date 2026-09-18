@@ -64,7 +64,7 @@
     },
     {
       "id": "edit",
-      "goal": "Edit the scoped todo {{todo_id}} to the exact supplied title '{{title}}' and save once.",
+      "goal": "In the scoped row, open Edit, set Edit title to the exact supplied title '{{title}}', and click Save changes once. Stop when the edit form closes and the new title is visible.",
       "scope": {
         "css": "[data-todo-id=\"{{todo_id}}\"]"
       },
@@ -120,7 +120,7 @@
     },
     {
       "id": "complete",
-      "goal": "Mark the scoped todo {{todo_id}} complete once.",
+      "goal": "Click the Complete button once within the scoped row.",
       "scope": {
         "css": "[data-todo-id=\"{{todo_id}}\"]"
       },
@@ -174,7 +174,7 @@
     },
     {
       "id": "uncomplete",
-      "goal": "Mark the scoped todo {{todo_id}} active (uncomplete) once.",
+      "goal": "Click the Uncomplete button once within the scoped row.",
       "scope": {
         "css": "[data-todo-id=\"{{todo_id}}\"]"
       },
@@ -228,7 +228,7 @@
     },
     {
       "id": "delete",
-      "goal": "Delete only the scoped todo with ID {{todo_id}} once.",
+      "goal": "In the scoped row, click Delete once. Stop when this row disappears.",
       "scope": {
         "css": "[data-todo-id=\"{{todo_id}}\"]"
       },
@@ -263,7 +263,7 @@
   "cleanup": [
     {
       "id": "cleanup-owned-todo",
-      "goal": "Delete only the run-owned todo with ID {{todo_id}} within the scoped row. Never touch any other row. Do not retry an ambiguous deletion.",
+      "goal": "Delete the run-owned scoped row by clicking its Delete button once. Never touch another row or retry an ambiguous deletion.",
       "scope": {
         "css": "[data-todo-id=\"{{todo_id}}\"]"
       },

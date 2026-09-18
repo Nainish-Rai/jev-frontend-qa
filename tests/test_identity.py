@@ -9,15 +9,25 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
+import subprocess
+import sys
 import time
 from types import SimpleNamespace
 
 import pytest
 
 from jev_frontend_qa import cli
-from jev_frontend_qa.core.browser import BrowserTransport, EvidenceDaemon, make_transport, validate_identity
+from jev_frontend_qa.core.browser import BrowserTransport, create_evidence_daemon, make_transport, validate_identity
 from jev_frontend_qa.core.evidence import EvidenceCollector
 from jev_frontend_qa.core.models import Policy, Scenario
+
+
+@pytest.fixture(autouse=True)
+def isolate_daemon_imports(tmp_path, monkeypatch):
+    for name in ("BH_HOME", "BH_AGENT_WORKSPACE", "BH_RUNTIME_DIR", "BH_TMP_DIR"):
+        monkeypatch.setenv(name, str(tmp_path / name))
+
 
 ORIGIN = "http://127.0.0.1:8767"
 
@@ -69,7 +79,7 @@ class SyntheticCDP:
 
 
 async def daemon_with_policy(selected_policy=None):
-    daemon = EvidenceDaemon()
+    daemon = create_evidence_daemon()
     daemon.cdp = SyntheticCDP()
     daemon.stop = asyncio.Event()
     await daemon.attach_first_page()
@@ -473,3 +483,48 @@ def test_fresh_read_obeys_capture_policy(tmp_path, monkeypatch):
     monkeypatch.setattr(transport, "_cdp", lambda *args, **kwargs: pytest.fail("Must not fetch disallowed evidence"))
     with pytest.raises(PermissionError):
         transport.fresh_read("/api/todos")
+
+
+def test_importing_cli_cannot_load_an_unapproved_harness_workspace(tmp_path):
+    workspace = tmp_path / "unapproved-workspace"
+    workspace.mkdir()
+    (workspace / ".env").write_text("QA_UNAPPROVED_ENV_LOADED=leaked\n")
+    environment = {**os.environ, "BH_AGENT_WORKSPACE": str(workspace)}
+    environment.pop("TYPESAFE_API_KEY", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os; import jev_frontend_qa.cli; print(os.getenv('QA_UNAPPROVED_ENV_LOADED', 'absent'))",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip() == "absent"
+
+
+def test_preflight_reports_redact_credentials_and_authored_secret_fixtures(tmp_path, monkeypatch, capsys):
+    argv = cli_fixture(tmp_path, monkeypatch)
+    data = cli.load_scenario(None).model_dump(mode="json")
+    data["name"] = "synthetic-credential fixture-private custom-private"
+    data["steps"][0]["fixtures"] = {"password": "fixture-private", "custom_secret": "custom-private"}
+    spec = Scenario.model_validate(data)
+    permissions = Policy.model_validate(
+        {
+            **policy().model_dump(mode="json"),
+            "redaction": {"redact_body_fields": ["custom_secret"]},
+        }
+    )
+    monkeypatch.setattr(cli, "load_scenario", lambda _: spec)
+    monkeypatch.setattr(cli, "load_policy", lambda _: permissions)
+    monkeypatch.setattr(cli, "_read_api_key", lambda: "synthetic-credential")
+    monkeypatch.setattr(cli, "make_transport", lambda **kwargs: pytest.fail("Denied identity must not launch"))
+    assert cli.main(argv + ["--attach-profile", "denied", "--cdp-url", "http://127.0.0.1:9222"]) == cli.EXIT_BLOCKED
+    terminal = capsys.readouterr().out
+    artifact = (tmp_path / "report.json").read_text()
+    for secret in ("synthetic-credential", "fixture-private", "custom-private"):
+        assert secret not in terminal
+        assert secret not in artifact
+    assert json.loads(artifact)["verdict"] == "blocked"

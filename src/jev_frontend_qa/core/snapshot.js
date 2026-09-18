@@ -1,5 +1,5 @@
 // snapshot.js — adapted from jev-ultrafast (MIT). Original copyright:
-// Copyright (c) browser-use. See THIRD_PARTY_NOTICES.md for the full notice.
+// Copyright (c) 2026 Browser Use. See THIRD_PARTY_NOTICES.md for the full notice.
 //
 // Atomically read visible content and controls, preserving actual DOM node
 // identity. The runner never lets the model generate selectors; node IDs are
@@ -58,21 +58,25 @@
     const scope=e.closest('form,dialog,[role="dialog"],article,li,tr,[role="row"]') || e.parentElement;
     return [identity(e),role(e),name(e),e.value??null,e.checked??null,e.selectedIndex??null,
       e.readOnly??null,e.matches(':disabled'),e.getAttribute('aria-disabled'),
-      e.getAttribute('aria-expanded'),e.getAttribute('aria-checked'),e.getAttribute('aria-selected'),
+      e.getAttribute('aria-expanded'),e.getAttribute('aria-checked'),e.getAttribute('aria-pressed'),e.getAttribute('aria-selected'),
       e.getAttribute('href'),e.getAttribute('name'),e.validity?.valid??null,
       e.validationMessage??null,e.getAttribute('aria-invalid'),scope?.innerText?.slice(0,6000)||''];
   };
-  const actions=[];
+  const actions=[], outside={above:[],below:[]};
   for (const e of document.querySelectorAll(selector)) {
     if (!safe(e) || !visible(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
     const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2, rname=role(e);
-    if (!rname || r.width<=0 || r.height<=0 || x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
+    if (!rname || r.width<=0 || r.height<=0 || x<0 || x>=innerWidth) continue;
+    if (y<0 || y>=innerHeight) {
+      outside[y<0?'above':'below'].push({node:identity(e),label:name(e)||rname});
+      continue;
+    }
     if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
     const base={node:identity(e),role:rname,label:name(e)||rname,
       fixture_key:e.getAttribute('name')||null,
       unsupported:e.tagName==='A' && !!e.target && e.target!=='_self',
       rect:{x:r.x,y:r.y,w:r.width,h:r.height}};
-    for (const key of ['checked','selected','expanded']) {
+    for (const key of ['checked','pressed','selected','expanded']) {
       const value=e.getAttribute('aria-'+key);
       if (value!==null) base[key]=value;
     }
@@ -112,12 +116,14 @@
   const semantics=actions.map(({rect,...action})=>action);
   const marker=[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
     document.title,text,semantics,page_key[6]];
-  const omitted_actions=Math.max(0,actions.length-250);
+  const omitted_actions=Math.max(0,actions.length-250)+
+    Math.max(0,outside.above.length-250)+Math.max(0,outside.below.length-250);
+  outside.above.splice(250); outside.below.splice(250);
   actions.splice(250);
   actions.forEach((a,i)=>a.id='e'+(i+1));
   const scrollDelta=Math.max(1,Math.floor(innerHeight*0.7));
-  if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:scrollDelta});
-  if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-scrollDelta});
+  if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:scrollDelta,reveals:outside.below});
+  if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-scrollDelta,reveals:outside.above});
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
     scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions,

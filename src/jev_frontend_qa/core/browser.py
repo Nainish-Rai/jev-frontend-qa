@@ -26,7 +26,6 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 from browser_harness import _ipc as bh_ipc
-from browser_harness.daemon import Daemon
 
 from .evidence import EvidenceCollector
 from .models import Policy
@@ -88,6 +87,7 @@ class ChromeLaunch:
             "--disable-sync",
             "--password-store=basic",
             "--use-mock-keychain",
+            "--window-size=1280,1000",
         ]
         if self.headless:
             args.append("--headless=new")
@@ -125,230 +125,235 @@ _POPUP_GUARD = """(() => {
 })()"""
 
 
-class EvidenceDaemon(Daemon):
-    """The upstream server with one owned tab and no personal-tab discovery."""
+def create_evidence_daemon():
+    from browser_harness.daemon import Daemon
 
-    def __init__(self) -> None:
-        super().__init__()
-        self._owned_session_id: str | None = None
-        self._qa_collector = EvidenceCollector(buffer_size=EVIDENCE_BUFFER)
-        self._capture_tasks: set[asyncio.Task] = set()
-        self._requests: dict[str, tuple[str, str, int | None]] = {}
-        self._policy = Policy()
-        self._deadline: float | None = None
+    class EvidenceDaemon(Daemon):
+        """The upstream server with one owned tab and no personal-tab discovery."""
 
-    async def attach_first_page(self, replaces_session=None, enable_domains=True):
-        if self.dedicated_target_id:
-            raise RuntimeError("Owned session was lost; automatic tab recovery is forbidden")
-        target = await self.cdp.send_raw("Target.createTarget", {"url": "about:blank", "background": True})
-        self.target_id = self.dedicated_target_id = target["targetId"]
-        session = await self.cdp.send_raw("Target.attachToTarget", {"targetId": self.target_id, "flatten": True})
-        self.session = self._owned_session_id = session["sessionId"]
-        return {"targetId": self.target_id}
+        def __init__(self) -> None:
+            super().__init__()
+            self._owned_session_id: str | None = None
+            self._qa_collector = EvidenceCollector(buffer_size=EVIDENCE_BUFFER)
+            self._capture_tasks: set[asyncio.Task] = set()
+            self._requests: dict[str, tuple[str, str, int | None]] = {}
+            self._policy = Policy()
+            self._deadline: float | None = None
 
-    def _schedule(self, coroutine) -> None:
-        task = asyncio.create_task(coroutine)
-        self._capture_tasks.add(task)
-        task.add_done_callback(self._capture_finished)
+        async def attach_first_page(self, replaces_session=None, enable_domains=True):
+            if self.dedicated_target_id:
+                raise RuntimeError("Owned session was lost; automatic tab recovery is forbidden")
+            target = await self.cdp.send_raw("Target.createTarget", {"url": "about:blank", "background": True})
+            self.target_id = self.dedicated_target_id = target["targetId"]
+            session = await self.cdp.send_raw("Target.attachToTarget", {"targetId": self.target_id, "flatten": True})
+            self.session = self._owned_session_id = session["sessionId"]
+            return {"targetId": self.target_id}
 
-    def _capture_finished(self, task: asyncio.Task) -> None:
-        self._capture_tasks.discard(task)
-        if task.cancelled() or task.exception() is not None:
-            self._qa_collector.mark_incomplete(None)
+        def _schedule(self, coroutine) -> None:
+            task = asyncio.create_task(coroutine)
+            self._capture_tasks.add(task)
+            task.add_done_callback(self._capture_finished)
 
-    def _captures(self, method: str, url: str) -> bool:
-        if not PolicyEnforcer(self._policy).check_request(method, url).allowed:
-            return False
-        rules = self._policy.network.capture_origins
-        if rules is None:
-            return True
-        parts = urlsplit(url)
-        origin = f"{parts.scheme}://{parts.netloc}"
-        return any(
-            str(rule.origin).rstrip("/") == origin
-            and method.upper() in rule.methods
-            and parts.path.startswith(rule.path_prefix)
-            for rule in rules
-        )
-
-    async def handle(self, req):
-        expected = bh_ipc.expected_token()
-        if expected is not None and req.get("token") != expected:
-            return {"error": "unauthorized"}
-        meta = req.get("meta")
-        if meta == "owned_session":
-            return {"target_id": self.target_id, "session_id": self._owned_session_id}
-        if meta == "set_evidence_policy":
-            self._policy = Policy.model_validate(req["policy"])
-            self._deadline = req.get("deadline")
-            self._qa_collector.set_rules(
-                [
-                    {
-                        "origin": str(rule.origin).rstrip("/"),
-                        "methods": sorted(rule.methods),
-                        "path_prefix": rule.path_prefix,
-                    }
-                    for rule in self._policy.network.allowed_origins
-                ]
-            )
-            return {"ok": True}
-        if meta == "drain_evidence":
-            end = time.monotonic() + min(float(req.get("settle_seconds", 2)), 2)
-            if self._deadline is not None:
-                end = min(end, self._deadline)
-            # A quiet turn is required even when no request has reached CDP yet.
-            quiet_since = time.monotonic()
-            while time.monotonic() < end:
-                if self._capture_tasks or self._qa_collector.pending_count:
-                    quiet_since = time.monotonic()
-                elif time.monotonic() - quiet_since >= 0.05:
-                    break
-                await asyncio.sleep(min(0.01, max(0, end - time.monotonic())))
-            if self._capture_tasks or self._qa_collector.pending_count:
-                self._qa_collector.mark_pending_incomplete()
+        def _capture_finished(self, task: asyncio.Task) -> None:
+            self._capture_tasks.discard(task)
+            if task.cancelled() or task.exception() is not None:
                 self._qa_collector.mark_incomplete(None)
+
+        def _captures(self, method: str, url: str) -> bool:
+            if not PolicyEnforcer(self._policy).check_request(method, url).allowed:
+                return False
+            rules = self._policy.network.capture_origins
+            if rules is None:
+                return True
+            parts = urlsplit(url)
+            origin = f"{parts.scheme}://{parts.netloc}"
+            return any(
+                str(rule.origin).rstrip("/") == origin
+                and method.upper() in rule.methods
+                and parts.path.startswith(rule.path_prefix)
+                for rule in rules
+            )
+
+        async def handle(self, req):
+            expected = bh_ipc.expected_token()
+            if expected is not None and req.get("token") != expected:
+                return {"error": "unauthorized"}
+            meta = req.get("meta")
+            if meta == "owned_session":
+                return {"target_id": self.target_id, "session_id": self._owned_session_id}
+            if meta == "set_evidence_policy":
+                self._policy = Policy.model_validate(req["policy"])
+                self._deadline = req.get("deadline")
+                self._qa_collector.set_rules(
+                    [
+                        {
+                            "origin": str(rule.origin).rstrip("/"),
+                            "methods": sorted(rule.methods),
+                            "path_prefix": rule.path_prefix,
+                        }
+                        for rule in self._policy.network.allowed_origins
+                    ]
+                )
+                return {"ok": True}
+            if meta == "drain_evidence":
+                end = time.monotonic() + min(float(req.get("settle_seconds", 2)), 2)
+                if self._deadline is not None:
+                    end = min(end, self._deadline)
+                # A quiet turn is required even when no request has reached CDP yet.
+                quiet_since = time.monotonic()
+                while time.monotonic() < end:
+                    if self._capture_tasks or self._qa_collector.pending_count:
+                        quiet_since = time.monotonic()
+                    elif time.monotonic() - quiet_since >= 0.05:
+                        break
+                    await asyncio.sleep(min(0.01, max(0, end - time.monotonic())))
+                if self._capture_tasks or self._qa_collector.pending_count:
+                    self._qa_collector.mark_pending_incomplete()
+                    self._qa_collector.mark_incomplete(None)
+                    for task in tuple(self._capture_tasks):
+                        task.cancel()
+                records, lost = self._qa_collector.drain()
+                return {"records": records, "lost": lost}
+            if meta == "shutdown":
                 for task in tuple(self._capture_tasks):
                     task.cancel()
-            records, lost = self._qa_collector.drain()
-            return {"records": records, "lost": lost}
-        if meta == "shutdown":
-            for task in tuple(self._capture_tasks):
-                task.cancel()
-            self.stop.set()
-            return {"ok": True}
-        if meta == "owned_auto_attach":
+                self.stop.set()
+                return {"ok": True}
+            if meta == "owned_auto_attach":
+                try:
+                    result = await self._send("Target.setAutoAttach", req["params"], self._owned_session_id)
+                    return {"result": result}
+                except TRANSPORT_ERRORS:
+                    self._qa_collector.mark_incomplete(None)
+                    return {"error": "Cannot guard owned child targets"}
+            if req.get("method") == "Target.closeTarget":
+                if req.get("params", {}).get("targetId") != self.target_id:
+                    return {"error": "Target is not owned"}
+                try:
+                    result = await asyncio.wait_for(
+                        self.cdp.send_raw("Target.closeTarget", {"targetId": self.target_id}), timeout=2
+                    )
+                    self.dedicated_target_id = None
+                    return {"result": result}
+                except TRANSPORT_ERRORS:
+                    return {"error": "Owned tab cleanup failed"}
             try:
-                result = await self._send("Target.setAutoAttach", req["params"], self._owned_session_id)
-                return {"result": result}
+                timeout = min(10, max(0, self._deadline - time.monotonic())) if self._deadline else 10
+                return await asyncio.wait_for(super().handle(req), timeout=timeout)
             except TRANSPORT_ERRORS:
                 self._qa_collector.mark_incomplete(None)
-                return {"error": "Cannot guard owned child targets"}
-        if req.get("method") == "Target.closeTarget":
-            if req.get("params", {}).get("targetId") != self.target_id:
-                return {"error": "Target is not owned"}
-            try:
-                result = await asyncio.wait_for(
-                    self.cdp.send_raw("Target.closeTarget", {"targetId": self.target_id}), timeout=2
-                )
-                self.dedicated_target_id = None
-                return {"result": result}
-            except TRANSPORT_ERRORS:
-                return {"error": "Owned tab cleanup failed"}
-        try:
-            timeout = min(10, max(0, self._deadline - time.monotonic())) if self._deadline else 10
-            return await asyncio.wait_for(super().handle(req), timeout=timeout)
-        except TRANSPORT_ERRORS:
-            self._qa_collector.mark_incomplete(None)
-            return {"error": "Browser operation failed or exceeded its deadline"}
+                return {"error": "Browser operation failed or exceeded its deadline"}
 
-    def _record_event(self, method, params, session_id=None):
-        params = params or {}
-        # Browser-level discovery contains other tabs' metadata. Never retain it.
-        if method == "Target.targetCreated":
-            info = params.get("targetInfo", {})
-            if info.get("openerId") == self.target_id:
-                self._qa_collector.mark_incomplete(None)
-                self._schedule(self._close_popup(info["targetId"]))
-            return
-        if session_id != self._owned_session_id:
-            return
-        try:
-            if method == "Target.attachedToTarget":
-                self._qa_collector.mark_incomplete(None)
-                self._schedule(self._close_popup(params["targetInfo"]["targetId"]))
-            elif method in {"Page.javascriptDialogOpening", "Runtime.bindingCalled"}:
-                self._qa_collector.mark_incomplete(None)
-                if method == "Page.javascriptDialogOpening":
-                    self._schedule(self._dismiss_dialog(session_id))
-            elif method == "Fetch.requestPaused":
-                self._schedule(self._handle_fetch(params, session_id))
-            elif method == "Network.requestWillBeSent":
-                request = params.get("request", {})
-                verb, url = request.get("method", "GET"), request.get("url", "")
-                request_id = params["requestId"]
-                self._requests.pop(request_id, None)
-                if self._captures(verb, url):
-                    self._requests[request_id] = (verb, url, None)
-                    self._qa_collector.handle_event(method, params, session_id)
-            elif params.get("requestId") in self._requests:
-                request_id = params["requestId"]
-                if method == "Network.responseReceived":
-                    verb, url, _ = self._requests[request_id]
-                    self._requests[request_id] = (verb, url, int(params["response"]["status"]))
-                self._qa_collector.handle_event(method, params, session_id)
-                if method == "Network.loadingFinished":
-                    self._schedule(self._capture_body(request_id, session_id))
-                elif method == "Network.loadingFailed":
-                    self._requests.pop(request_id, None)
-        except TRANSPORT_ERRORS:
-            self._qa_collector.mark_incomplete(None)
-
-    async def _send(self, method: str, params: dict, session_id=None):
-        timeout = min(5, max(0, self._deadline - time.monotonic())) if self._deadline else 5
-        try:
-            return await asyncio.wait_for(self.cdp.send_raw(method, params, session_id=session_id), timeout)
-        except Exception as error:
-            raise RuntimeError("Browser protocol request failed") from error
-
-    async def _close_popup(self, target_id: str) -> None:
-        try:
-            await self._send("Target.closeTarget", {"targetId": target_id})
-        except TRANSPORT_ERRORS:
-            self._qa_collector.mark_incomplete(None)
-
-    async def _dismiss_dialog(self, session_id: str) -> None:
-        try:
-            await self._send("Page.handleJavaScriptDialog", {"accept": False}, session_id)
-        except TRANSPORT_ERRORS:
-            self._qa_collector.mark_incomplete(None)
-
-    async def _handle_fetch(self, params: dict, session_id: str) -> None:
-        request = params.get("request", {})
-        method, url = request.get("method", "GET"), request.get("url", "")
-        try:
-            allowed = PolicyEnforcer(self._policy).check_request(method, url).allowed
-            if not allowed:
-                self._qa_collector.mark_denied(method, url)
-                await self._send(
-                    "Fetch.failRequest",
-                    {"requestId": params["requestId"], "errorReason": "BlockedByClient"},
-                    session_id,
-                )
+        def _record_event(self, method, params, session_id=None):
+            params = params or {}
+            # Browser-level discovery contains other tabs' metadata. Never retain it.
+            if method == "Target.targetCreated":
+                info = params.get("targetInfo", {})
+                if info.get("openerId") == self.target_id:
+                    self._qa_collector.mark_incomplete(None)
+                    self._schedule(self._close_popup(info["targetId"]))
                 return
-            if self._captures(method, url):
-                self._qa_collector.handle_event("Fetch.requestPaused", params, session_id)
-                network_id = params.get("networkId")
-                if network_id:
-                    self._requests.setdefault(network_id, (method, url, None))
-            await self._send("Fetch.continueRequest", {"requestId": params["requestId"]}, session_id)
-        except TRANSPORT_ERRORS:
-            # Fetch IDs are NOT Network IDs; only networkId can identify a record.
-            self._qa_collector.mark_incomplete(params.get("networkId"))
+            if session_id != self._owned_session_id:
+                return
+            try:
+                if method == "Target.attachedToTarget":
+                    self._qa_collector.mark_incomplete(None)
+                    self._schedule(self._close_popup(params["targetInfo"]["targetId"]))
+                elif method in {"Page.javascriptDialogOpening", "Runtime.bindingCalled"}:
+                    self._qa_collector.mark_incomplete(None)
+                    if method == "Page.javascriptDialogOpening":
+                        self._schedule(self._dismiss_dialog(session_id))
+                elif method == "Fetch.requestPaused":
+                    self._schedule(self._handle_fetch(params, session_id))
+                elif method == "Network.requestWillBeSent":
+                    request = params.get("request", {})
+                    verb, url = request.get("method", "GET"), request.get("url", "")
+                    request_id = params["requestId"]
+                    self._requests.pop(request_id, None)
+                    if self._captures(verb, url):
+                        self._requests[request_id] = (verb, url, None)
+                        self._qa_collector.handle_event(method, params, session_id)
+                elif params.get("requestId") in self._requests:
+                    request_id = params["requestId"]
+                    if method == "Network.responseReceived":
+                        verb, url, _ = self._requests[request_id]
+                        self._requests[request_id] = (verb, url, int(params["response"]["status"]))
+                    self._qa_collector.handle_event(method, params, session_id)
+                    if method == "Network.loadingFinished":
+                        self._schedule(self._capture_body(request_id, session_id))
+                    elif method == "Network.loadingFailed":
+                        self._requests.pop(request_id, None)
+            except TRANSPORT_ERRORS:
+                self._qa_collector.mark_incomplete(None)
 
-    async def _capture_body(self, request_id: str, session_id: str) -> None:
-        try:
-            method, _, status = self._requests[request_id]
-            if method == "HEAD" or status in {204, 205, 304}:
-                body = ""
-            else:
-                response = await self._send("Network.getResponseBody", {"requestId": request_id}, session_id)
-                body = response["body"]
-                if response.get("base64Encoded"):
-                    body = base64.b64decode(body, validate=True).decode("utf-8")
-            self._qa_collector.attach_response_body(request_id, body)
-        except TRANSPORT_ERRORS:
-            self._qa_collector.mark_incomplete(request_id)
-        finally:
-            self._requests.pop(request_id, None)
+        async def _send(self, method: str, params: dict, session_id=None):
+            timeout = min(5, max(0, self._deadline - time.monotonic())) if self._deadline else 5
+            try:
+                return await asyncio.wait_for(self.cdp.send_raw(method, params, session_id=session_id), timeout)
+            except Exception as error:
+                raise RuntimeError("Browser protocol request failed") from error
+
+        async def _close_popup(self, target_id: str) -> None:
+            try:
+                await self._send("Target.closeTarget", {"targetId": target_id})
+            except TRANSPORT_ERRORS:
+                self._qa_collector.mark_incomplete(None)
+
+        async def _dismiss_dialog(self, session_id: str) -> None:
+            try:
+                await self._send("Page.handleJavaScriptDialog", {"accept": False}, session_id)
+            except TRANSPORT_ERRORS:
+                self._qa_collector.mark_incomplete(None)
+
+        async def _handle_fetch(self, params: dict, session_id: str) -> None:
+            request = params.get("request", {})
+            method, url = request.get("method", "GET"), request.get("url", "")
+            try:
+                allowed = PolicyEnforcer(self._policy).check_request(method, url).allowed
+                if not allowed:
+                    self._qa_collector.mark_denied(method, url)
+                    await self._send(
+                        "Fetch.failRequest",
+                        {"requestId": params["requestId"], "errorReason": "BlockedByClient"},
+                        session_id,
+                    )
+                    return
+                if self._captures(method, url):
+                    self._qa_collector.handle_event("Fetch.requestPaused", params, session_id)
+                    network_id = params.get("networkId")
+                    if network_id:
+                        self._requests.setdefault(network_id, (method, url, None))
+                await self._send("Fetch.continueRequest", {"requestId": params["requestId"]}, session_id)
+            except TRANSPORT_ERRORS:
+                # Fetch IDs are NOT Network IDs; only networkId can identify a record.
+                self._qa_collector.mark_incomplete(params.get("networkId"))
+
+        async def _capture_body(self, request_id: str, session_id: str) -> None:
+            try:
+                method, _, status = self._requests[request_id]
+                if method == "HEAD" or status in {204, 205, 304}:
+                    body = ""
+                else:
+                    response = await self._send("Network.getResponseBody", {"requestId": request_id}, session_id)
+                    body = response["body"]
+                    if response.get("base64Encoded"):
+                        body = base64.b64decode(body, validate=True).decode("utf-8")
+                self._qa_collector.attach_response_body(request_id, body)
+            except TRANSPORT_ERRORS:
+                self._qa_collector.mark_incomplete(request_id)
+            finally:
+                self._requests.pop(request_id, None)
+
+    return EvidenceDaemon()
 
 
 def _daemon_subprocess_script() -> str:
     return (
         "import asyncio, os, signal\n"
         "from browser_harness.daemon import serve\n"
-        "from jev_frontend_qa.core.browser import EvidenceDaemon\n"
+        "from jev_frontend_qa.core.browser import create_evidence_daemon\n"
         "async def main():\n"
-        "    d = EvidenceDaemon()\n"
+        "    d = create_evidence_daemon()\n"
         "    task = asyncio.current_task()\n"
         "    if os.name == 'posix':\n"
         "        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)\n"
@@ -451,6 +456,8 @@ class BrowserTransport:
         self._cdp("Target.setAutoAttach", autoAttach=True, waitForDebuggerOnStart=True, flatten=True)
         self._ipc_call({"method": "Target.setDiscoverTargets", "params": {"discover": True}})
         self._cdp("Fetch.enable", patterns=[{"requestStage": "Request"}])
+        # A reproducible owned-tab viewport is independent of the host's last window size.
+        self.set_viewport(1280, 900)
         # Hidden targets do not reliably acknowledge compositor input such as wheel events.
         self._cdp("Page.bringToFront")
         self.focus_emulation()

@@ -6,7 +6,7 @@
   "steps": [
     {
       "id": "reject-blank",
-      "goal": "Replace the Todo title input with the exact supplied title fixture, including all whitespace or an empty string. Click Create todo once, then stop when the UI reports invalid title. This checks client-side rejection, not a direct API request.",
+      "goal": "Submit an empty Todo title once. The expected outcome is the visible message 'Title must not be blank or whitespace only.' Stop as soon as that message appears; do not correct the input or submit again.",
       "fixtures": {
         "title": ""
       },
@@ -57,7 +57,7 @@
     },
     {
       "id": "reject-whitespace",
-      "goal": "Replace the Todo title input with the exact supplied title fixture, including all whitespace or an empty string. Click Create todo once, then stop when the UI reports invalid title. This checks client-side rejection, not a direct API request.",
+      "goal": "Set Todo title to exactly the supplied three spaces and submit once. The expected outcome is the visible message 'Title must not be blank or whitespace only.' Stop as soon as that message appears; do not trim or correct the input.",
       "fixtures": {
         "title": "   "
       },

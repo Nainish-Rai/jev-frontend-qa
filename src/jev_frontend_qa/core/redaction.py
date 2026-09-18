@@ -53,6 +53,11 @@ def redact_body(body: Any, policy: RedactionPolicy, *, jsonpath_fields: Iterable
     return _sanitize(body, fields, ())
 
 
+def fixture_secrets(fixtures: Mapping[str, str], policy: RedactionPolicy) -> tuple[str, ...]:
+    fields = _SECRET_FIELDS | {name.casefold() for name in policy.redact_body_fields}
+    return tuple(value for name, value in fixtures.items() if value and name.casefold() in fields)
+
+
 def redact_report(value: Any, policy: RedactionPolicy, *, secrets: Iterable[str] = ()) -> Any:
     fields = (
         _SECRET_FIELDS

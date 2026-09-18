@@ -112,10 +112,7 @@
     const toggleLabel = todo.completed ? "Uncomplete" : "Complete";
     toggleBtn.textContent = toggleLabel;
     toggleBtn.setAttribute("aria-label", `${toggleLabel} ${todo.title}`);
-    toggleBtn.setAttribute(
-      "aria-pressed",
-      todo.completed ? "true" : "false"
-    );
+    // The changing label names the next action, not an aria-pressed state.
     const editBtn = row.querySelector('[data-action="edit"]');
     editBtn.textContent = "Edit";
     editBtn.setAttribute("aria-label", `Edit ${todo.title}`);

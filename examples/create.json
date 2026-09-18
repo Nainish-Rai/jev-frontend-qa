@@ -66,7 +66,7 @@
   "cleanup": [
     {
       "id": "cleanup-owned-todo",
-      "goal": "Delete only the run-owned todo with ID {{todo_id}} within the scoped row. Never touch any other row. Do not retry an ambiguous deletion.",
+      "goal": "Delete the run-owned scoped row by clicking its Delete button once. Never touch another row or retry an ambiguous deletion.",
       "scope": {
         "css": "[data-todo-id=\"{{todo_id}}\"]"
       },

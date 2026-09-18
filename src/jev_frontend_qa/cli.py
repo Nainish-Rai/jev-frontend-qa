@@ -30,8 +30,9 @@ from .core.config import load_config
 from .core.decisions import TypeSafeDecisionProvider
 from .core.evidence import EvidenceCollector
 from .core.model_client import ModelClient, ModelError
-from .core.models import Policy, Report, Scenario, StepResult
+from .core.models import Policy, RedactionPolicy, Report, Scenario, StepResult
 from .core.policy import PolicyEnforcer
+from .core.redaction import fixture_secrets, redact_report
 
 EXIT_PASS = 0
 EXIT_FAIL = 1
@@ -120,6 +121,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     mode = "attach" if args.attach_profile is not None or args.cdp_url is not None else "isolated"
     scenario = None
+    policy = None
     transport = None
     client = None
     started = int(time.time() * 1000)
@@ -204,7 +206,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             exit_code=EXIT_ERROR,
         )
     try:
-        _emit_outcome(args, outcome)
+        _emit_outcome(args, outcome, scenario=scenario, policy=policy)
     except OSError:
         print(
             json.dumps(
@@ -285,8 +287,15 @@ def _early_outcome(scenario: Scenario | None, mode: str, started: int, verdict: 
     return RunOutcome(report=report, exit_code=EXIT_BLOCKED if verdict == "blocked" else EXIT_ERROR)
 
 
-def _emit_outcome(args: argparse.Namespace, outcome: RunOutcome) -> None:
-    payload = outcome.report.model_dump(mode="json")
+def _emit_outcome(
+    args: argparse.Namespace, outcome: RunOutcome, *, scenario: Scenario | None, policy: Policy | None
+) -> None:
+    redaction = policy.redaction if policy else RedactionPolicy()
+    secrets = {_read_api_key() or ""}
+    if scenario:
+        for step in (*scenario.steps, *scenario.cleanup):
+            secrets.update(fixture_secrets(step.fixtures, redaction))
+    payload = redact_report(outcome.report.model_dump(mode="json"), redaction, secrets=secrets)
     payload["exit"] = outcome.exit_code
     import os
 

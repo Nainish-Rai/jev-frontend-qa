@@ -176,46 +176,18 @@ class Selector(_StrictModel):
         return self
 
 
-class JsonPath(_StrictModel):
-    """Caller-authored JSON field path used to read API responses."""
-
-    path: str
-
-    @field_validator("path")
-    @classmethod
-    def _validate_path(cls, value: str) -> str:
-        candidate = value.strip()
-        if not candidate or not candidate.startswith("$"):
-            raise ValueError("JsonPath must start with '$'")
-        return candidate
-
-
 # Assertion kinds. Each is a code-authorised check; the model never authors
 # selectors or fields, only receives the caller's expected behaviour.
 class EqualsAssertion(_StrictModel):
     kind: Literal["equals"]
-    selector: Selector | None = None
-    jsonpath: JsonPath | None = None
+    selector: Selector
     expected: Any
-
-    @model_validator(mode="after")
-    def _validate_target(self) -> EqualsAssertion:
-        if (self.selector is None) == (self.jsonpath is None):
-            raise ValueError("EqualsAssertion requires exactly one target")
-        return self
 
 
 class ContainsAssertion(_StrictModel):
     kind: Literal["contains"]
-    selector: Selector | None = None
-    jsonpath: JsonPath | None = None
+    selector: Selector
     expected: str | list[Any] | dict[str, Any]
-
-    @model_validator(mode="after")
-    def _validate_target(self) -> ContainsAssertion:
-        if (self.selector is None) == (self.jsonpath is None):
-            raise ValueError("ContainsAssertion requires exactly one target")
-        return self
 
 
 class StatusAssertion(_StrictModel):
@@ -256,7 +228,7 @@ class NetworkAssertion(_StrictModel):
     kind: Literal["network"]
     method: str
     path: str
-    expected_status: int | None = Field(default=None, ge=100, le=599)
+    expected_status: int = Field(ge=100, le=599)
     payload_contains: dict[str, Any] | None = None
     response_contains: dict[str, Any] | None = None
     capture: dict[str, str] = Field(default_factory=dict)
